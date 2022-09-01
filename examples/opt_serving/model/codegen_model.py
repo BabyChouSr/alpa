@@ -50,41 +50,40 @@ class CodeGenConfig:
     # parallelize
     # mark_boundary: bool = True
 
-# Copied from transformers.models.bart.modeling_flax_bart.FlaxBartAttention with Bart->OPT
 class CodeGenAttention(nn.Module):
     config: CodeGenConfig
-    embed_dim: int
-    num_heads: int
-    dropout: float = 0.0
-    causal: bool = False
-    bias: bool = True
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
+
+    dtype: jnp.dtype = jnp.float32
 
     def setup(self) -> None:
-        self.head_dim = self.embed_dim // self.num_heads
-        if self.head_dim * self.num_heads != self.embed_dim:
+        max_positions = self.config.max_position_embeddings
+        # self.register_buffer(
+        #     "bias",
+        #     jnp.tril(jnp.ones((max_positions, max_positions), dtype=jnp.bool)).view(
+        #         1, 1, max_positions, max_positions
+        #     ),
+        # )
+
+        # TODO(chris): replace register_buffer with nn.make_casual_mask
+        # self.register_buffer("masked_bias", jnp.array(-1e9))
+
+        self.attn_dropout = nn.Dropout(rate=self.config.attn_pdrop)
+        self.resid_dropout = nn.Dropout(rate=self.config.resid_pdrop)
+
+        self.embed_dim = self.config.hidden_size
+        self.num_attention_heads = self.config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_attention_heads
+        if self.head_dim * self.num_attention_heads != self.embed_dim:
             raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
-                f" and `num_heads`: {self.num_heads})."
+                f"embed_dim must be divisible by num_attention_heads (got `embed_dim`: {self.embed_dim} and `num_attention_heads`: {self.num_attention_heads})."
             )
+        self.scale_attn = jnp.sqrt(jnp.array(self.head_dim, dtype=jnp.float32))
+        self.qkv_proj = nn.Linear(self.embed_dim, self.embed_dim * 3, bias=False)
 
-        dense = partial(
-            nn.Dense,
-            self.embed_dim,
-            use_bias=self.bias,
-            dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
-        )
-
-        self.q_proj, self.k_proj, self.v_proj = dense(), dense(), dense()
-        self.out_proj = dense()
-
-        self.dropout_layer = nn.Dropout(rate=self.dropout)
-
-        if self.causal:
-            self.causal_mask = make_causal_mask(
-                jnp.ones((1, self.config.max_position_embeddings), dtype="bool"), dtype="bool"
-            )
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.rotary_dim = None
+        if self.config.rotary_dim is not None:
+            self.rotary_dim = self.config.rotary_dim
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
