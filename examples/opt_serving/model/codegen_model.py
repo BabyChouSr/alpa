@@ -1,750 +1,1126 @@
-""" Flax CodeGen model."""
-
-from functools import partial
-from typing import Optional, Tuple
-
+"""CodeGen model implementation."""
 import dataclasses
 from dataclasses import dataclass
+from functools import partial
+import itertools
+import math
+import os
+from typing import Callable, Optional, Tuple, Dict, Sequence
+
+import alpa
+from alpa.device_mesh import (DistributedArray, ReplicatedDistributedArray,
+                              MeshHostWorker, create_remote_array_refs)
+from alpa.model.model_util import ModelOutput
+from alpa.pipeline_parallel.primitive_def import mark_pipeline_boundary
 import flax.linen as nn
 import jax
-import jax.numpy as jnp
-from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
-from flax.linen import combine_masks, make_causal_mask
-from flax.linen.attention import dot_product_attention_weights
-from flax.traverse_util import flatten_dict, unflatten_dict
+import flax
 from jax import lax
-from jax.random import PRNGKey
+import jax.numpy as jnp
+from jax.tree_util import tree_flatten, tree_unflatten, tree_leaves
+from jax.interpreters import pxla
+import jaxlib.xla_extension as jax_xla
+import numpy as np
+import ray
+from tqdm import tqdm
 
-from ...modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
-from ...modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from ...utils import add_start_docstrings, logging
+ACT2FN = {
+    "gelu": partial(nn.gelu, approximate=False),
+    "relu": nn.relu,
+    "silu": nn.swish,
+    "swish": nn.swish,
+    "gelu_new": partial(nn.gelu, approximate=True),
+}
 
-logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "Salesforce/codegen-350M-mono"
-_CONFIG_FOR_DOC = "CodeGenConfig"
-_TOKENIZER_FOR_DOC = "GPT2Tokenizer"
+@flax.struct.dataclass
+class OPTModelOutput(ModelOutput):
+    last_hidden_state: jax_xla.DeviceArray
+    hidden_states: Optional[Tuple[jax_xla.DeviceArray]] = None
+    attentions: Optional[Tuple[jax_xla.DeviceArray]] = None
+    attention_cache: Optional[Tuple[Tuple[jax_xla.DeviceArray]]] = None
+
+
+@flax.struct.dataclass
+class OPTLMOutput(ModelOutput):
+    logits: jax_xla.DeviceArray
+    hidden_states: Optional[Tuple[jax_xla.DeviceArray]] = None
+    attentions: Optional[Tuple[jax_xla.DeviceArray]] = None
+    attention_cache: Optional[Tuple[Tuple[jax_xla.DeviceArray]]] = None
+
 
 @dataclass(frozen=True)
-class CodeGenConfig:
+class OPTConfig:
     # Inherited from OPT
-    vocab_size: int = 50400,
-    n_positions: int = 2048,
-    n_ctx: int = 2048,
-    n_embd: int = 4096,
-    n_layer: int = 28,
-    n_head: int = 16,
-    rotary_dim: int = 64,
-    n_inner: int = None,
-    activation_function: str = "gelu_new",
-    resid_pdrop: int = 0.0,
-    embd_pdrop: int = 0.0,
-    attn_pdrop: int = 0.0,
-    layer_norm_epsilon: float = 1e-5,
-    initializer_range: float = 0.02,
-    scale_attn_weights: bool = True,
-    gradient_checkpointing: bool = False,
-    use_cache: bool = True,
-    bos_token_id: int = 50256,
-    eos_token_id: int = 50256
+    decoder_layers: int = 12
+    max_target_positions: int = 2048
+    decoder_embed_dim: int = 768
+    decoder_attention_heads: int = 12
+    decoder_input_dim: int = 768
+    decoder_ffn_embed_dim: int = 3072
+    pad: int = 1
+    activation_fn: str = 'relu'
+    dtype: any = jnp.float16
+    use_stable_embedding: bool = False
+    no_scale_embedding: bool = True
+    decoder_learned_pos: bool = True
+    decoder_normalize_before: bool = True
+    share_decoder_input_output_embed: bool = True
+    # Added
+    version: int = 1
+    vocab_size: int = 50272
+    layer_norm_eps: float = 0.00001
+    num_pp_stages: int = None,
+    rotary_dim: int = 64
     # parallelize
-    # mark_boundary: bool = True
+    mark_boundary: bool = True
 
-class CodeGenAttention(nn.Module):
-    config: CodeGenConfig
 
-    dtype: jnp.dtype = jnp.float32
+class OPTEmbeddings(nn.Module):
+    """Construct the embeddings from word, position and token_type embeddings."""
 
-    def setup(self) -> None:
-        max_positions = self.config.max_position_embeddings
-        # self.register_buffer(
-        #     "bias",
-        #     jnp.tril(jnp.ones((max_positions, max_positions), dtype=jnp.bool)).view(
-        #         1, 1, max_positions, max_positions
-        #     ),
-        # )
+    config: OPTConfig
+    dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
-        # TODO(chris): replace register_buffer with nn.make_casual_mask
-        # self.register_buffer("masked_bias", jnp.array(-1e9))
+    def setup(self):
+        assert not self.config.use_stable_embedding
+        self.embed_scale = 1.0 if self.config.no_scale_embedding else math.sqrt(
+            self.config.decoder_embed_dim)
+        self.word_embeddings = nn.Embed(
+            self.config.vocab_size,
+            self.config.decoder_input_dim,
+            dtype=self.dtype,
+        )
+        assert self.config.max_target_positions is not None
+        assert self.config.decoder_learned_pos
+        self.position_embeddings = nn.Embed(
+            self.config.max_target_positions + self.config.pad + 1,
+            self.config.decoder_embed_dim,
+            dtype=self.dtype,
+        )
+        self.project_in_dim = nn.Dense(
+            self.config.decoder_embed_dim,
+            dtype=self.dtype,
+        ) if self.config.decoder_input_dim != self.config.decoder_embed_dim else None
 
-        self.attn_dropout = nn.Dropout(rate=self.config.attn_pdrop)
-        self.resid_dropout = nn.Dropout(rate=self.config.resid_pdrop)
+    def __call__(self, input_ids, position_ids):
+        # Embed
+        inputs_embeds = self.embed_scale * self.word_embeddings(
+            input_ids.astype("i4"))
+        if self.project_in_dim is not None:
+            inputs_embeds = self.project_in_dim(inputs_embeds)
+        position_embeds = self.position_embeddings(position_ids.astype("i4"))
 
-        self.embed_dim = self.config.hidden_size
-        self.num_attention_heads = self.config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_attention_heads
-        if self.head_dim * self.num_attention_heads != self.embed_dim:
+        # Sum all embeddings
+        hidden_states = inputs_embeds + position_embeds
+        return hidden_states
+
+
+class OPTSelfAttention(nn.Module):
+    config: OPTConfig
+    dtype: jnp.dtype = jnp.float16  # the dtype of the computation
+
+    def setup(self):
+        if self.config.decoder_embed_dim % self.config.decoder_attention_heads != 0:
             raise ValueError(
-                f"embed_dim must be divisible by num_attention_heads (got `embed_dim`: {self.embed_dim} and `num_attention_heads`: {self.num_attention_heads})."
+                f"`decoder_embed_dim`: {self.config.decoder_embed_dim} has to be a "
+                f"multiple of `decoder_attention_heads`: {self.config.decoder_attention_heads}"
             )
-        self.scale_attn = jnp.sqrt(jnp.array(self.head_dim, dtype=jnp.float32))
-        self.qkv_proj = nn.Linear(self.embed_dim, self.embed_dim * 3, bias=False)
 
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.rotary_dim = None
-        if self.config.rotary_dim is not None:
-            self.rotary_dim = self.config.rotary_dim
+        self.qkv_combined = nn.Dense(
+            self.config.decoder_embed_dim * 3,
+            dtype=self.dtype,
+        )
+        
+        self.rotary_value = self.config.rotary_value
 
-    def _split_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+    def __call__(self,
+                 hidden_states,
+                 sinusoidal_pos,
+                 output_attentions: bool = False,
+                 attention_cache=None,
+                 attention_mask=None):
+        head_dim = self.config.decoder_embed_dim // self.config.decoder_attention_heads
 
-    def _merge_heads(self, hidden_states):
-        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+        qkv_combined_states = self.qkv_combined(hidden_states)
+        qkv_combined_states = qkv_combined_states.reshape(
+            qkv_combined_states.shape[:2] + (-1, 3))
+        query_states, key_states, value_states = jnp.split(qkv_combined_states,
+                                                           3,
+                                                           axis=3)
 
-    @nn.compact
-    def _concatenate_to_cache(self, key, value, query, attention_mask):
-        """
-        This function takes projected key, value states from a single input token and concatenates the states to cached
-        states from previous steps. This function is slighly adapted from the official Flax repository:
-        https://github.com/google/flax/blob/491ce18759622506588784b4fca0e4bf05f8c8cd/flax/linen/attention.py#L252
-        """
-        # detect if we're initializing by absence of existing cache data.
-        is_initialized = self.has_variable("cache", "cached_key")
-        cached_key = self.variable("cache", "cached_key", jnp.zeros, key.shape, key.dtype)
-        cached_value = self.variable("cache", "cached_value", jnp.zeros, value.shape, value.dtype)
-        cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
+        # shape: [B, S, #head, head_dim]
+        query_states = query_states.reshape(hidden_states.shape[:2] + (
+            self.config.decoder_attention_heads, head_dim))
+        # shape: [B, S, #head, head_dim]
+        value_states = value_states.reshape(hidden_states.shape[:2] + (
+            self.config.decoder_attention_heads, head_dim))
+        # shape: [B, S, #head, head_dim]
+        key_states = key_states.reshape(hidden_states.shape[:2] +
+                                        (self.config.decoder_attention_heads,
+                                         head_dim))
+        
 
-        if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
-            # update key, value caches with our new 1d spatial slices
-            cur_index = cache_index.value
-            indices = (0,) * len(batch_dims) + (cur_index, 0, 0)
-            key = lax.dynamic_update_slice(cached_key.value, key, indices)
-            value = lax.dynamic_update_slice(cached_value.value, value, indices)
-            cached_key.value = key
-            cached_value.value = value
-            num_updated_cache_vectors = query.shape[1]
-            cache_index.value = cache_index.value + num_updated_cache_vectors
-            # causal mask for cached decoder self-attention: our single query position should only attend to those key positions that have already been generated and cached, not the remaining zero elements.
-            pad_mask = jnp.broadcast_to(
-                jnp.arange(max_length) < cur_index + num_updated_cache_vectors,
-                tuple(batch_dims) + (1, num_updated_cache_vectors, max_length),
+        # TODO(chris): fix this to check for the rotary_dim existence instead
+        if self.rotary_dim:
+            query_states, key_states, value_states = self.apply_rotary_position_embeddings(
+                sinusoidal_pos, query_states, key_states, value_states
             )
-            attention_mask = combine_masks(pad_mask, attention_mask)
-        return key, value, attention_mask
+        else:
+            query_states, key_states = self.apply_rotary_position_embeddings(
+                sinusoidal_pos, query_states, key_states
+            )
 
-    def __call__(
-        self,
-        hidden_states: jnp.ndarray,
-        key_value_states: Optional[jnp.ndarray] = None,
-        attention_mask: Optional[jnp.ndarray] = None,
-        init_cache: bool = False,
-        deterministic: bool = True,
-    ) -> Tuple[jnp.ndarray]:
-        """Input shape: Batch x Time x Channel"""
-
-        # if key_value_states are provided this layer is used as a cross-attention layer
-        # for the decoder
-        is_cross_attention = key_value_states is not None
         batch_size = hidden_states.shape[0]
-
-        # get query proj
-        query_states = self.q_proj(hidden_states)
-        # get key, value proj
-        if is_cross_attention:
-            # cross_attentions
-            key_states = self.k_proj(key_value_states)
-            value_states = self.v_proj(key_value_states)
+        if attention_cache is None:
+            query_len, key_len = query_states.shape[1], key_states.shape[1]
+            assert query_len == key_len
+            # shape: [B, 1, S_max, S_max]
+            causal_mask = nn.make_causal_mask(
+                jnp.ones((batch_size, key_len)), dtype="bool")
+            # shape: [B, 1, 1, S_max]
+            input_mask = attention_mask
+            # shape: [B, 1, S_max, S_max]
+            mask = nn.combine_masks(causal_mask, input_mask, dtype="bool")
         else:
-            # self_attention
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            cache_key, cache_value, cache_index = attention_cache
+            cache_index_ = cache_index[0]
+            update_indices = (0, cache_index_, 0, 0)
+            # shape: [B, S_max, #head, head_dim]
+            key_states = lax.dynamic_update_slice(cache_key, key_states, update_indices)
+            # shape: [B, S_max, #head, head_dim]
+            value_states = lax.dynamic_update_slice(cache_value, value_states, update_indices)
+            query_len, key_len = query_states.shape[1], key_states.shape[1]
 
-        query_states = self._split_heads(query_states)
-        key_states = self._split_heads(key_states)
-        value_states = self._split_heads(value_states)
+            # Handle a special kind of internal padding added by alpa.
+            # Note that this kind of internal padding is different from
+            # the padding added by the tokenizer. This internal padding
+            # should not update cache and step_ct
+            # shape: [B, 1, 1, S_max]
+            is_internal_padding = (attention_mask == 2)
+            num_internal_pad = jnp.sum(is_internal_padding, axis=3).reshape(-1)
+            attention_mask = (attention_mask == 1)
 
-        # handle cache prepare causal attention mask
-        if self.causal:
-            query_length, key_length = query_states.shape[1], key_states.shape[1]
-            if self.has_variable("cache", "cached_key"):
-                mask_shift = self.variables["cache"]["cache_index"]
-                max_decoder_length = self.variables["cache"]["cached_key"].shape[1]
-                causal_mask = lax.dynamic_slice(
-                    self.causal_mask, (0, 0, mask_shift, 0), (1, 1, query_length, max_decoder_length)
-                )
-            else:
-                causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-            causal_mask = jnp.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
+            attention_cache = key_states, value_states, cache_index + query_len - num_internal_pad
 
-        # combine masks if needed
-        if attention_mask is not None and self.causal:
-            attention_mask = jnp.broadcast_to(jnp.expand_dims(attention_mask, axis=(-3, -2)), causal_mask.shape)
-            attention_mask = combine_masks(attention_mask, causal_mask)
-        elif self.causal:
-            attention_mask = causal_mask
-        elif attention_mask is not None:
-            attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
+            # shape: [B, 1, S_max, S_max]
+            causal_mask = nn.make_causal_mask(
+                jnp.ones((batch_size, key_len)), dtype="bool")
+            # shape: [B, 1, S, S_max]
+            causal_mask = lax.dynamic_slice(causal_mask,
+                (0, 0, cache_index_, 0), (batch_size, 1, query_len, key_len))
+            # shape: [B, 1, 1, S_max]
+            input_mask = attention_mask
+            # shape: [B, 1, S, S_max]
+            mask = nn.combine_masks(causal_mask, input_mask, dtype="bool")
 
-        # During fast autoregressive decoding, we feed one position at a time,
-        # and cache the keys and values step by step.
-        if self.causal and (self.has_variable("cache", "cached_key") or init_cache):
-            key_states, value_states, attention_mask = self._concatenate_to_cache(
-                key_states, value_states, query_states, attention_mask
-            )
-
-        # Convert the boolean attention mask to an attention bias.
-        if attention_mask is not None:
-            # attention mask in the form of attention bias
-            attention_bias = lax.select(
-                attention_mask > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(self.dtype),
-                jnp.full(attention_mask.shape, float("-inf")).astype(self.dtype),
-            )
-        else:
-            attention_bias = None
-
-        dropout_rng = None
-        if not deterministic and self.dropout > 0.0:
-            dropout_rng = self.make_rng("dropout")
-
-        attn_weights = dot_product_attention_weights(
+        attn_weights = nn.attention.dot_product_attention_weights(
             query_states,
             key_states,
-            bias=attention_bias,
-            dropout_rng=dropout_rng,
-            dropout_rate=self.dropout,
-            broadcast_dropout=True,
-            deterministic=deterministic,
+            mask=mask,
             dtype=self.dtype,
             precision=None,
         )
 
-        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, value_states)
-        attn_output = self._merge_heads(attn_output)
-        attn_output = self.out_proj(attn_output)
+        attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights,
+                                 value_states)
+        attn_output = attn_output.reshape(attn_output.shape[:2] + (-1,))
 
-        return attn_output, attn_weights
+        outputs = (attn_output, attention_cache,
+                   attn_weights) if output_attentions else (attn_output,
+                                                            attention_cache)
+        return outputs
 
 
-class FlaxOPTDecoderLayer(nn.Module):
+        
+    # taken from https://github.com/huggingface/transformers/blob/80367cd1fb6d36ca6bdd99b70586aab4ffae1ae1/src/transformers/models/roformer/modeling_flax_roformer.py#L275
+    @staticmethod
+    def apply_rotary_position_embeddings(sinusoidal_pos, query_layer, key_layer, value_layer=None):
+        sin, cos = sinusoidal_pos.split(2, axis=-1)
+        sin_pos = jnp.stack([sin, sin], axis=-1).reshape(sinusoidal_pos.shape)
+        cos_pos = jnp.stack([cos, cos], axis=-1).reshape(sinusoidal_pos.shape)
+
+        def rotate_layer(layer, sin_pos, cos_pos):
+            rotate_half_layer = jnp.stack([-layer[..., 1::2], layer[..., ::2]], axis=-1).reshape(layer.shape)
+            rotary_matrix_cos = jnp.einsum("bslh,...sh->bslh", layer, cos_pos)
+            rotary_matrix_sin = jnp.einsum("bslh,...sh->bslh", rotate_half_layer, sin_pos)
+            return rotary_matrix_cos + rotary_matrix_sin
+
+        query_layer = rotate_layer(query_layer, sin_pos, cos_pos)
+        key_layer = rotate_layer(key_layer, sin_pos, cos_pos)
+        if value_layer is not None:
+            value_layer = rotate_layer(value_layer, sin_pos, cos_pos)
+            return query_layer, key_layer, value_layer
+        return query_layer, key_layer
+
+
+class OPTAttention(nn.Module):
     config: OPTConfig
-    dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.float16
 
-    def setup(self) -> None:
-        self.embed_dim = self.config.hidden_size
-        self.self_attn = FlaxOPTAttention(
-            config=self.config,
-            embed_dim=self.embed_dim,
-            num_heads=self.config.num_attention_heads,
-            dropout=self.config.attention_dropout,
-            causal=True,
+    def setup(self):
+        assert self.config.decoder_normalize_before
+        self.self = OPTSelfAttention(self.config, dtype=self.dtype)
+        self.dense = nn.Dense(
+            self.config.decoder_embed_dim,
             dtype=self.dtype,
         )
-        self.do_layer_norm_before = self.config.do_layer_norm_before
-        self.dropout_layer = nn.Dropout(rate=self.config.dropout)
-        self.activation_fn = ACT2FN[self.config.activation_function]
+        self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
+                                       dtype=self.dtype)
 
-        self.self_attn_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-        self.fc1 = nn.Dense(
-            self.config.ffn_dim,
-            dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
-        )
-        self.fc2 = nn.Dense(
-            self.embed_dim, dtype=self.dtype, kernel_init=jax.nn.initializers.normal(self.config.init_std)
-        )
-        self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-
-    def __call__(
-        self,
-        hidden_states: jnp.ndarray,
-        attention_mask: jnp.ndarray,
-        init_cache: bool = False,
-        output_attentions: bool = True,
-        deterministic: bool = True,
-    ) -> Tuple[jnp.ndarray]:
-
+    def __call__(self,
+                 hidden_states,
+                 output_attentions: bool = False,
+                 attention_cache=None,
+                 attention_mask=None):
         residual = hidden_states
-
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
-        # Self Attention
-        hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            init_cache=init_cache,
-            deterministic=deterministic,
-        )
-        hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
-        hidden_states = residual + hidden_states
-        # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
-        # Fully Connected
-        hidden_states_shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        residual = hidden_states
-
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
-
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
-
-        hidden_states = (residual + hidden_states).reshape(hidden_states_shape)
-
-        # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
-
-        outputs = (hidden_states,)
+        hidden_states = self.layer_norm(hidden_states)
+        attn_outputs = self.self(hidden_states,
+                                 output_attentions=output_attentions,
+                                 attention_cache=attention_cache,
+                                 attention_mask=attention_mask)
+        attn_output = attn_outputs[0]
+        attention_cache = attn_outputs[1]
+        hidden_states = self.dense(attn_output)
+        hidden_states = hidden_states + residual
+        outputs = (hidden_states, attention_cache)
 
         if output_attentions:
-            outputs += (self_attn_weights,)
+            outputs += (attn_outputs[2],)
 
         return outputs
 
 
-class FlaxOPTDecoderLayerCollection(nn.Module):
+class OPTFFN(nn.Module):
     config: OPTConfig
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
+    dtype: jnp.dtype = jnp.float16  # the dtype of the computation
+
+    def setup(self):
+        self.fc1 = nn.Dense(
+            self.config.decoder_ffn_embed_dim,
+            dtype=self.dtype,
+        )
+        self.activation = ACT2FN[self.config.activation_fn]
+        self.fc2 = nn.Dense(
+            self.config.decoder_embed_dim,
+            dtype=self.dtype,
+        )
+        self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
+                                       dtype=self.dtype)
+
+    def __call__(self, hidden_states):
+        residual = hidden_states
+        hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.activation(self.fc1(hidden_states))
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = hidden_states + residual
+        return hidden_states
+
+
+class OPTTransformerLayer(nn.Module):
+    config: OPTConfig
+    dtype: jnp.dtype = jnp.float16  # the dtype of the computation
+
+    def setup(self):
+        assert self.config.decoder_normalize_before
+        assert not getattr(self.config, "cross_self_attention", False)
+        assert not getattr(self.config, "scale_heads", False)
+        assert not getattr(self.config, "scale_attn", False)
+        assert not getattr(self.config, "scale_fc", False)
+        self.attention = OPTAttention(self.config, dtype=self.dtype)
+        self.ffn = OPTFFN(self.config, dtype=self.dtype)
+
+    def __call__(self,
+                 hidden_states,
+                 output_attentions: bool = False,
+                 attention_cache=None,
+                 attention_mask=None):
+
+        attention_outputs = self.attention(hidden_states,
+                                           output_attentions=output_attentions,
+                                           attention_cache=attention_cache,
+                                           attention_mask=attention_mask)
+        attention_output = attention_outputs[0]
+        attention_cache = attention_outputs[1]
+
+        hidden_states = self.ffn(attention_output)
+
+        outputs = (hidden_states, attention_cache)
+
+        if output_attentions:
+            outputs += (attention_outputs[2],)
+        return outputs
+
+
+class OPTTransformerLayerCollection(nn.Module):
+    config: OPTConfig
+    dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
         self.layers = [
-            FlaxOPTDecoderLayer(self.config, name=str(i), dtype=self.dtype)
-            for i in range(self.config.num_hidden_layers)
+            OPTTransformerLayer(self.config, name=str(i), dtype=self.dtype)
+            for i in range(self.config.decoder_layers)
         ]
-        self.layerdrop = self.config.layerdrop
 
     def __call__(
         self,
         hidden_states,
-        attention_mask,
-        deterministic: bool = True,
-        init_cache: bool = False,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-    ):
-        # decoder layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
-
-        for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
-
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
-                deterministic=deterministic,
-            )
-
-            hidden_states = layer_outputs[0]
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        outputs = [hidden_states, all_hidden_states, all_self_attns]
-        return outputs
-
-
-class FlaxOPTLearnedPositionalEmbedding(nn.Embed):
-    """
-    This module learns positional embeddings up to a fixed maximum size.
-    """
-
-    def setup(self):
-        self.offset = 2
-        self.embedding = self.param(
-            "embedding", self.embedding_init, (self.num_embeddings + self.offset, self.features), self.param_dtype
-        )
-
-    def __call__(self, positions):
-        """`input_ids_shape` is expected to be [bsz x seqlen]."""
-
-        return super().__call__(positions + self.offset)
-
-
-class FlaxOPTDecoder(nn.Module):
-    config: OPTConfig
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
-    offset: int = 2
-
-    def setup(self):
-        self.dropout_layer = nn.Dropout(rate=self.config.dropout)
-
-        embed_dim = self.config.hidden_size
-        self.padding_idx = self.config.pad_token_id
-        self.max_target_positions = self.config.max_position_embeddings
-
-        self.embed_tokens = nn.Embed(
-            self.config.vocab_size,
-            self.config.word_embed_proj_dim,
-            embedding_init=jax.nn.initializers.normal(self.config.init_std),
-        )
-
-        self.embed_positions = FlaxOPTLearnedPositionalEmbedding(
-            self.config.max_position_embeddings,
-            embed_dim,
-            embedding_init=jax.nn.initializers.normal(self.config.init_std),
-        )
-
-        if self.config.word_embed_proj_dim != self.config.hidden_size:
-            self.project_in = nn.Dense(self.config.hidden_size, use_bias=False)
-            self.project_out = nn.Dense(self.config.word_embed_proj_dim, use_bias=False)
-
-        else:
-            self.project_in = None
-            self.project_out = None
-
-        # Note that the only purpose of `config._remove_final_layer_norm` is to keep backward compatibility
-        # with checkpoints that have been fine-tuned before transformers v4.20.1
-        # see https://github.com/facebookresearch/metaseq/pull/164
-        if self.config.do_layer_norm_before and not self.config._remove_final_layer_norm:
-            self.final_layer_norm = nn.LayerNorm(dtype=self.dtype, epsilon=1e-05)
-        else:
-            self.final_layer_norm = None
-
-        self.layers = FlaxOPTDecoderLayerCollection(self.config, self.dtype)
-
-    def __call__(
-        self,
-        input_ids,
-        attention_mask,
-        position_ids,
-        init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        deterministic: bool = True,
+        attention_cache=None,
+        attention_mask=None
     ):
-        input_shape = input_ids.shape
-        input_ids = input_ids.reshape(-1, input_shape[-1])
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+        new_attention_cache = () if attention_cache is not None else None
 
-        inputs_embeds = self.embed_tokens(input_ids)
-        if self.project_in is not None:
-            inputs_embeds = self.project_in(inputs_embeds)
+        if self.config.num_pp_stages is not None:
+            assert self.config.decoder_layers % self.config.num_pp_stages == 0
+            layers_per_stage = self.config.decoder_layers // self.config.num_pp_stages
 
-        positions = self.embed_positions(position_ids)
+        for i, layer in enumerate(self.layers):
+            if self.config.num_pp_stages is not None:
+                if i % layers_per_stage == 0 and i != 0:
+                    stage_id = i // layers_per_stage
+                    if self.config.mark_boundary:
+                        mark_pipeline_boundary()
 
-        hidden_states = inputs_embeds + positions
-
-        hidden_states = self.dropout_layer(hidden_states, deterministic=deterministic)
-
-        hidden_state, all_hidden_states, attentions = self.layers(
-            hidden_states,
-            attention_mask,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-        )
-
-        if self.final_layer_norm is not None:
-            hidden_state = self.final_layer_norm(hidden_state)
-
-        if self.project_out is not None:
-            hidden_state = self.project_out(hidden_state)
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            layer_attention_cache = None
+            if attention_cache is not None:
+                layer_attention_cache = attention_cache[i]
+            layer_outputs = layer(hidden_states,
+                                  output_attentions=output_attentions,
+                                  attention_cache=layer_attention_cache,
+                                  attention_mask=attention_mask)
+            hidden_states = layer_outputs[0]
+            if attention_cache is not None:
+                new_attention_cache += (layer_outputs[1],)
+            if output_attentions:
+                all_attentions += (layer_outputs[2],)
 
         if output_hidden_states:
-            all_hidden_states += (hidden_state,)
+            all_hidden_states += (hidden_states,)
 
-        outputs = [hidden_state, all_hidden_states, attentions]
+        outputs = (hidden_states,)
 
         if not return_dict:
             return tuple(v for v in outputs if v is not None)
 
-        return FlaxBaseModelOutput(
-            last_hidden_state=hidden_state,
-            hidden_states=all_hidden_states,
-            attentions=attentions,
-        )
+        return OPTModelOutput(last_hidden_state=hidden_states,
+                              hidden_states=all_hidden_states,
+                              attentions=all_attentions,
+                              attention_cache=new_attention_cache)
 
 
-class FlaxOPTPreTrainedModel(FlaxPreTrainedModel):
-    config_class = OPTConfig
-    base_model_prefix: str = "model"
-    module_class: nn.Module = None
-
-    def __init__(
-        self,
-        config: OPTConfig,
-        input_shape: Tuple[int] = (1, 1),
-        seed: int = 0,
-        dtype: jnp.dtype = jnp.float32,
-        _do_init: bool = True,
-        **kwargs
-    ):
-        module = self.module_class(config=config, dtype=dtype, **kwargs)
-        super().__init__(config, module, input_shape=input_shape, seed=seed, dtype=dtype, _do_init=_do_init)
-
-    def init_weights(self, rng: jax.random.PRNGKey, input_shape: Tuple, params: FrozenDict = None) -> FrozenDict:
-        # init input tensors
-        input_ids = jnp.zeros(input_shape, dtype="i4")
-        attention_mask = jnp.ones_like(input_ids)
-
-        batch_size, sequence_length = input_ids.shape
-        position_ids = jnp.broadcast_to(jnp.arange(sequence_length)[None, :], (batch_size, sequence_length))
-
-        params_rng, dropout_rng = jax.random.split(rng)
-        rngs = {"params": params_rng, "dropout": dropout_rng}
-
-        module_init_outputs = self.module.init(
-            rngs,
-            input_ids,
-            attention_mask,
-            position_ids,
-            return_dict=False,
-        )
-
-        random_params = module_init_outputs["params"]
-        if params is not None:
-            random_params = flatten_dict(unfreeze(random_params))
-            params = flatten_dict(unfreeze(params))
-            for missing_key in self._missing_keys:
-                params[missing_key] = random_params[missing_key]
-            self._missing_keys = set()
-            return freeze(unflatten_dict(params))
-        else:
-            return random_params
-
-    def init_cache(self, batch_size, max_length):
-        r"""
-        Args:
-            batch_size (`int`):
-                batch_size used for fast auto-regressive decoding. Defines the batch size of the initialized cache.
-            max_length (`int`):
-                maximum possible length for auto-regressive decoding. Defines the sequence length of the initialized
-                cache.
-        """
-        # init input variables to retrieve cache
-        input_ids = jnp.ones((batch_size, max_length), dtype="i4")
-        attention_mask = jnp.ones_like(input_ids, dtype="i4")
-        position_ids = jnp.broadcast_to(jnp.arange(jnp.atleast_2d(input_ids).shape[-1]), input_ids.shape)
-
-        init_variables = self.module.init(
-            jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
-        )
-        return unfreeze(init_variables["cache"])
-
-    def __call__(
-        self,
-        input_ids: jnp.ndarray,
-        attention_mask: Optional[jnp.ndarray] = None,
-        position_ids: Optional[jnp.ndarray] = None,
-        params: dict = None,
-        past_key_values: dict = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        dropout_rng: PRNGKey = None,
-        deterministic: bool = True,
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-        if attention_mask is None:
-            attention_mask = jnp.ones_like(input_ids)
-
-        if position_ids is None:
-            position_ids = (attention_mask.cumsum(axis=1) * attention_mask) - 1
-
-        # Handle any PRNG if needed
-        rngs = {"dropout": dropout_rng} if dropout_rng is not None else {}
-
-        inputs = {"params": params or self.params}
-
-        # if past_key_values are passed then cache is already initialized a private flag init_cache has to be passed
-        # down to ensure cache is used. It has to be made sure that cache is marked as mutable so that it can be
-        # changed by FlaxOPTAttention module
-        if past_key_values:
-            inputs["cache"] = past_key_values
-            mutable = ["cache"]
-        else:
-            mutable = False
-
-        outputs = self.module.apply(
-            inputs,
-            input_ids=jnp.array(input_ids, dtype="i4"),
-            attention_mask=jnp.array(attention_mask, dtype="i4"),
-            position_ids=jnp.array(position_ids, dtype="i4"),
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            deterministic=deterministic,
-            rngs=rngs,
-            mutable=mutable,
-        )
-
-        # add updated cache to model output
-        if past_key_values is not None and return_dict:
-            outputs, past_key_values = outputs
-            outputs["past_key_values"] = unfreeze(past_key_values["cache"])
-            return outputs
-        elif past_key_values is not None and not return_dict:
-            outputs, past_key_values = outputs
-            outputs = outputs[:1] + (unfreeze(past_key_values["cache"]),) + outputs[1:]
-
-        return outputs
-
-
-class FlaxOPTModule(nn.Module):
+class OPTTransformerModule(nn.Module):
     config: OPTConfig
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
+    dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
-        self.decoder = FlaxOPTDecoder(self.config, dtype=self.dtype)
-
-    def _get_decoder_module(self):
-        return self.decoder
+        assert self.config.decoder_normalize_before
+        self.embeddings = OPTEmbeddings(self.config, dtype=self.dtype)
+        self.encoder = OPTTransformerLayerCollection(self.config,
+                                                     dtype=self.dtype)
+        if self.config.version > 2:
+            self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
+                                           dtype=self.dtype)
 
     def __call__(
         self,
         input_ids,
-        attention_mask,
         position_ids,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        deterministic: bool = True,
-        init_cache=False,
+        attention_cache=None,
+        attention_mask=None
     ):
-
-        decoder_outputs = self.decoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+        hidden_states = self.embeddings(input_ids, position_ids)
+        outputs = self.encoder(
+            hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            deterministic=deterministic,
-            init_cache=init_cache,
+            attention_cache=attention_cache,
+            attention_mask=attention_mask
         )
+        hidden_states = outputs[0]
+        if self.config.version > 2:
+            hidden_states = self.layer_norm(hidden_states)
 
         if not return_dict:
-            return decoder_outputs
+            # if pooled is None, don't return it
+            return (hidden_states,) + outputs[1:]
 
-        return FlaxBaseModelOutput(
-            last_hidden_state=decoder_outputs.last_hidden_state,
-            hidden_states=decoder_outputs.hidden_states,
-            attentions=decoder_outputs.attentions,
+        return OPTModelOutput(
+            last_hidden_state=hidden_states,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            attention_cache=outputs.attention_cache,
         )
 
 
-# Copied from transformers.models.bart.modeling_flax_bart.FlaxBartModel with Bart->OPT
-class FlaxOPTModel(FlaxOPTPreTrainedModel):
+class OPTForLMModule(nn.Module):
     config: OPTConfig
-    dtype: jnp.dtype = jnp.float32  # the dtype of the computation
-    module_class = FlaxOPTModule
-
-
-append_call_sample_docstring(
-    FlaxOPTModel, _TOKENIZER_FOR_DOC, _CHECKPOINT_FOR_DOC, FlaxBaseModelOutput, _CONFIG_FOR_DOC
-)
-
-
-@add_start_docstrings(
-    "The bare OPT Model transformer outputting raw hidden-states without any specific head on top.",
-    OPT_START_DOCSTRING,
-)
-class FlaxOPTForCausalLMModule(nn.Module):
-    config: OPTConfig
-    dtype: jnp.dtype = jnp.float32
+    dtype: jnp.dtype = jnp.float16
+    bias_init: Callable[..., jnp.ndarray] = jax.nn.initializers.zeros
 
     def setup(self):
-        self.model = FlaxOPTModule(config=self.config, dtype=self.dtype)
-        self.lm_head = nn.Dense(
-            self.config.vocab_size,
-            use_bias=False,
+        self.transformers = OPTTransformerModule(config=self.config,
+                                                 dtype=self.dtype)
+
+        self.project_out_dim = nn.Dense(
+            self.config.decoder_input_dim,
             dtype=self.dtype,
-            kernel_init=jax.nn.initializers.normal(self.config.init_std),
-        )
+        ) if self.config.decoder_input_dim != self.config.decoder_embed_dim else None
+
+        if self.config.share_decoder_input_output_embed:
+            self.decoder = None
+        else:
+            self.decoder = nn.Dense(self.config.vocab_size,
+                                    dtype=self.dtype,
+                                    use_bias=False)
 
     def __call__(
         self,
         input_ids,
-        attention_mask,
         position_ids,
-        init_cache: bool = False,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-        deterministic: bool = True,
+        attention_cache=None,
+        attention_mask=None
     ):
-
-        outputs = self.model(
+        # Model
+        outputs = self.transformers(
             input_ids,
-            attention_mask,
             position_ids,
-            init_cache=init_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            deterministic=deterministic,
+            attention_cache=attention_cache,
+            attention_mask=attention_mask
         )
 
         hidden_states = outputs[0]
 
-        if self.config.tie_word_embeddings:
-            shared_embedding = self.model.variables["params"]["decoder"]["embed_tokens"]["embedding"]
-            lm_logits = self.lm_head.apply({"params": {"kernel": shared_embedding.T}}, hidden_states)
+        if self.project_out_dim is not None:
+            hidden_states = self.project_out_dim(hidden_states)
+
+        if self.config.share_decoder_input_output_embed:
+            if self.dtype == jnp.float16:
+                shared_embedding = self.transformers.embeddings.word_embeddings.embedding_fp16
+            else:
+                shared_embedding = self.transformers.variables["params"][
+                    "embeddings"]["word_embeddings"]["embedding"]
+            assert self.decoder is None
+            logits = hidden_states @ shared_embedding.T
         else:
-            lm_logits = self.lm_head(hidden_states)
+            assert self.decoder is not None
+            logits = self.decoder(hidden_states)
 
+        # Compute the prediction scores
         if not return_dict:
-            return (lm_logits,) + outputs[1:]
+            return (logits,) + outputs[1:]
 
-        return FlaxMaskedLMOutput(
-            logits=lm_logits,
+        return OPTLMOutput(
+            logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            attention_cache=outputs.attention_cache,
         )
 
 
-@add_start_docstrings(
-    """
-    OPT Model with a language modeling head on top (linear layer with weights tied to the input embeddings) e.g for
-    autoregressive tasks.
-    """,
-    OPT_START_DOCSTRING,
-)
-class FlaxOPTForCausalLM(FlaxOPTPreTrainedModel):
-    module_class = FlaxOPTForCausalLMModule
+def get_opt_config(name, **kwargs):
+    if name == "125M":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=12, decoder_attention_heads=12,
+            decoder_embed_dim=768, decoder_input_dim=768, decoder_ffn_embed_dim=768 * 4,
+            version=3,
+        )
+    elif name == "350M":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=24, decoder_attention_heads=16,
+            decoder_embed_dim=1024, decoder_input_dim=1024, decoder_ffn_embed_dim=1024 * 4,
+            version=2,
+        )
+        raise NotImplementedError()
+    elif name == "1.3B":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=24, decoder_attention_heads=32,
+            decoder_embed_dim=2048, decoder_input_dim=2048, decoder_ffn_embed_dim=2048 * 4,
+            version=3,
+        )
+    elif name == "2.7B":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=32, decoder_attention_heads=32,
+            decoder_embed_dim=2560, decoder_input_dim=2560, decoder_ffn_embed_dim=2560 * 4,
+            version=3,
+        )
+    elif name == "6.7B":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=32, decoder_attention_heads=32,
+            decoder_embed_dim=4096, decoder_input_dim=4096, decoder_ffn_embed_dim=4096 * 4,
+            version=3,
+        )
+    elif name == "30B":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=48, decoder_attention_heads=56,
+            decoder_embed_dim=7168, decoder_input_dim=7168, decoder_ffn_embed_dim=7168 * 4,
+            version=3,
+        )
+    elif name == "66B":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=64, decoder_attention_heads=72,
+            decoder_embed_dim=9216, decoder_input_dim=9216, decoder_ffn_embed_dim=9216 * 4,
+            version=3,
+        )
+    elif name == "175B":
+        config = OPTConfig(
+            max_target_positions=2048, decoder_layers=96, decoder_attention_heads=96,
+            decoder_embed_dim=12288, decoder_input_dim=12288, decoder_ffn_embed_dim=12288 * 4,
+            version=3,
+        )
+    else:
+        raise ValueError(f"Invalid model name: {name}")
 
-    def prepare_inputs_for_generation(self, input_ids, max_length, attention_mask: Optional[jnp.DeviceArray] = None):
-        # initializing the cache
-        batch_size, seq_length = input_ids.shape
+    return dataclasses.replace(config, **kwargs)
 
-        past_key_values = self.init_cache(batch_size, max_length)
-        # Note that usually one would have to put 0's in the attention_mask for x > input_ids.shape[-1] and x < cache_length.
-        # But since the decoder uses a causal mask, those positions are masked anyway.
-        # Thus, we can create a single static attention_mask here, which is more efficient for compilation
-        extended_attention_mask = jnp.ones((batch_size, max_length), dtype="i4")
 
-        if attention_mask is not None:
-            position_ids = attention_mask.cumsum(axis=1) - 1
-            extended_attention_mask = lax.dynamic_update_slice(extended_attention_mask, attention_mask, (0, 0))
+def init_model_aval(config):
+    """Initialize model with parameters with abstract values (shape-only arrays)."""
+    model = OPTForLMModule(config, dtype=config.dtype)
+    rngkey = jax.core.ShapedArray((2,), jnp.uint32)
+    input_ids = jax.core.ShapedArray((1, 128), jnp.int32)
+    position_ids = jax.core.ShapedArray((1, 128), jnp.int32)
+    params = jax.eval_shape(model.init, rngkey, input_ids, position_ids)
+    params = jax.tree_map(lambda x: jax.ShapeDtypeStruct(x.shape, config.dtype),
+                          params)
+    return model, params
+
+
+def init_cache_aval(config, batch_size):
+    """Initialize cache with abstract values (shape-only arrays)."""
+    dtype = config.dtype
+    head_dim = config.decoder_embed_dim // config.decoder_attention_heads
+
+    all_cache = []
+    for _ in range(config.decoder_layers):
+        layer_cache = (
+            jax.core.ShapedArray((batch_size, config.max_target_positions,
+                                  config.decoder_attention_heads, head_dim),
+                                 dtype),
+            jax.core.ShapedArray((batch_size, config.max_target_positions,
+                                  config.decoder_attention_heads, head_dim),
+                                 dtype),
+            jax.core.ShapedArray((batch_size,), jnp.int32),
+        )
+        all_cache.append(layer_cache)
+    return tuple(all_cache)
+
+
+def init_mask_aval(config, batch_size):
+    """Initialize attention mask with abstract values (shape-only arrays)."""
+    mask = jax.core.ShapedArray((batch_size, 1, 1, config.max_target_positions), dtype=np.int8)
+    return mask
+
+
+def init_cache_np(config, batch_size):
+    """Init cache with numpy arrays."""
+    np_dtype = np.float32 if config.dtype == jnp.float32 else np.float16
+    head_dim = config.decoder_embed_dim // config.decoder_attention_heads
+
+    all_cache = []
+    for i in range(config.decoder_layers):
+        layer_cache = (
+            np.zeros((batch_size, config.max_target_positions,
+                      config.decoder_attention_heads, head_dim),
+                     dtype=np_dtype),
+            np.zeros((batch_size, config.max_target_positions,
+                      config.decoder_attention_heads, head_dim),
+                     dtype=np_dtype),
+            np.zeros((batch_size,), np.int32),
+        )
+        all_cache.append(layer_cache)
+    return tuple(all_cache)
+
+
+def build_position_ids(input_ids, padding_idx):
+    mask = (input_ids != padding_idx).astype(np.int32)
+    position_ids = np.cumsum(mask, axis=1).astype(np.int32) * mask + padding_idx
+    return position_ids
+
+
+def inference_step_no_cache(params, batch, apply_func):
+    logits = apply_func(params, batch["input_ids"], batch["position_ids"])[0]
+    return logits
+
+
+def load_params_np(params, path, config, dummy=False):
+    """Load parameters with numpy arrays."""
+    if dummy:
+        np_dtype = np.float32 if config.dtype == jnp.float32 else np.float16
+        return jax.tree_map(lambda x: np.full(x.shape, 1e-9, np_dtype), params)
+
+    def load_array(key):
+        return np.load(os.path.join(path, key))
+
+    def load_param(param_key, loaded_array, is_position_embedding=False):
+        param_dict = params
+        param_keys = param_key.split('.')
+        for i, key in enumerate(param_keys):
+            if i == len(param_keys) - 1:
+                if dummy:
+                    param_dict[key] = jax.core.ShapedArray(
+                        param_dict[key].shape, param_dict[key].dtype)
+                else:
+                    if not is_position_embedding:
+                        assert param_dict[key].shape == loaded_array.shape, (
+                                f"{param_dict[key].shape} vs. {loaded_array.shape}")
+                    else:
+                        shape = param_dict[key].shape
+                        if shape != loaded_array.shape:
+                            assert shape[1] == loaded_array.shape[1]
+                            loaded_array = loaded_array[:shape[0], :]
+                    param_dict[key] = loaded_array
+            else:
+                param_dict = param_dict[key]
+
+    params = params.unfreeze()
+    load_param("params.transformers.embeddings.word_embeddings.embedding",
+               load_array("decoder.embed_tokens.weight"))
+    load_param("params.transformers.embeddings.position_embeddings.embedding",
+               load_array("decoder.embed_positions.weight"),
+               is_position_embedding=True)
+    if config.version > 2:
+        load_param("params.transformers.layer_norm.scale",
+                   load_array("decoder.layer_norm.weight"))
+        load_param("params.transformers.layer_norm.bias",
+                   load_array("decoder.layer_norm.bias"))
+    for i in tqdm(range(config.decoder_layers)):
+        param_prefix = f"params.transformers.encoder.{i}."
+        load_prefix = f"decoder.layers.{i}."
+        # Attention weights
+        wq = load_array(load_prefix + "self_attn.q_proj.weight")
+        wk = load_array(load_prefix + "self_attn.k_proj.weight")
+        wv = load_array(load_prefix + "self_attn.v_proj.weight")
+        dim = wq.shape[-1]
+        w_qkv = np.concatenate([wq, wk, wv], axis=0).reshape(
+            (3, -1, dim)).transpose([2, 1, 0]).reshape((dim, -1))
+        load_param(param_prefix + "attention.self.qkv_combined.kernel", w_qkv)
+        bq = load_array(load_prefix + "self_attn.q_proj.bias")
+        bk = load_array(load_prefix + "self_attn.k_proj.bias")
+        bv = load_array(load_prefix + "self_attn.v_proj.bias")
+        b_qkv = np.concatenate([bq, bk, bv], axis=0).reshape(
+            (3, dim)).transpose([1, 0]).reshape((-1,))
+        load_param(param_prefix + "attention.self.qkv_combined.bias", b_qkv)
+        load_param(
+            param_prefix + "attention.dense.kernel",
+            np.transpose(load_array(load_prefix + "self_attn.out_proj.weight")))
+        load_param(param_prefix + "attention.dense.bias",
+                   load_array(load_prefix + "self_attn.out_proj.bias"))
+        load_param(param_prefix + "attention.layer_norm.scale",
+                   load_array(load_prefix + "self_attn_layer_norm.weight"))
+        load_param(param_prefix + "attention.layer_norm.bias",
+                   load_array(load_prefix + "self_attn_layer_norm.bias"))
+        # FFN weights
+        load_param(param_prefix + "ffn.fc1.bias",
+                   load_array(load_prefix + "fc1.bias"))
+        load_param(param_prefix + "ffn.fc1.kernel",
+                   np.transpose(load_array(load_prefix + "fc1.weight")))
+        load_param(param_prefix + "ffn.fc2.bias",
+                   load_array(load_prefix + "fc2.bias"))
+        load_param(param_prefix + "ffn.fc2.kernel",
+                   np.transpose(load_array(load_prefix + "fc2.weight")))
+        load_param(param_prefix + "ffn.layer_norm.scale",
+                   load_array(load_prefix + "final_layer_norm.weight"))
+        load_param(param_prefix + "ffn.layer_norm.bias",
+                   load_array(load_prefix + "final_layer_norm.bias"))
+
+    return flax.core.freeze(params)
+
+
+def get_jax_executable(config: OPTConfig,
+                       encoder_chunk_sizes: Sequence[int],
+                       output_attentions: bool = False,
+                       output_hidden_states:bool = False):
+    """Get a single-gpu executable."""
+    model, params = init_model_aval(config)
+
+    @jax.jit
+    def inference_step(params, batch):
+        output = model.apply(params,
+                             batch["input_ids"],
+                             batch["position_ids"],
+                             attention_cache=batch["cache"],
+                             attention_mask=batch["mask"],
+                             output_attentions=output_attentions,
+                             output_hidden_states=output_hidden_states)
+        return output
+
+    executables = {}
+    for length in encoder_chunk_sizes:
+        executables[length] = inference_step
+    return executables, params
+
+
+def get_pipeshard_executable(config: OPTConfig,
+                             batch_size: int,
+                             encoder_chunk_sizes: Sequence[int],
+                             num_micro_batches: int = 1,
+                             output_attentions: bool = False,
+                             output_hidden_states: bool = False,
+                             autoregressive: bool = True):
+    """Get a parallel executable."""
+    # Init model
+    model, params = init_model_aval(config)
+
+    # Parallelize
+    method = alpa.PipeshardParallel(
+        num_micro_batches=num_micro_batches,
+        pipeline_schedule="inference",
+        layer_option="manual",
+        default_auto_sharding_option=alpa.AutoShardingOption(
+            # Force operator model parallel
+            force_batch_dim_to_mesh_dim=None if batch_size == 1 else 0,
+            # Disabling all-to-all and all-gather generates better intra-op strategies.
+            allow_all_to_all=False,
+            allow_all_gather=False,
+        ))
+    #method = alpa.ShardParallel()
+
+    if autoregressive:
+
+        def inference_step_with_cache(params, batch):
+            output = model.apply(
+                params,
+                batch["input_ids"],
+                batch["position_ids"],
+                attention_cache=batch["cache"],
+                attention_mask=batch["mask"],
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states)
+            return output
+
+        alpa.global_config.always_donate_micro_batch_vars = False
+
+        cache = init_cache_aval(config, batch_size)
+        mask = init_mask_aval(config, batch_size)
+
+        executables = {}
+
+        # Compile an executable with sequence length 1
+        executable = alpa.parallelize(
+            inference_step_with_cache, batch_argnums=(1,),
+            method=method).get_executable(
+                params, {
+                    "input_ids":
+                        jax.core.ShapedArray((batch_size, 1), jnp.int32),
+                    "position_ids":
+                        jax.core.ShapedArray((batch_size, 1), jnp.int32),
+                    "cache":
+                        cache,
+                    "mask":
+                        mask,
+                })
+        executable.dump_debug_info("tmp_executable_1")
+        executables[1] = executable
+
+        # Create another parallel method with assigned input sharding specs
+        method_with_input_sharding = alpa.PipeshardParallel(
+            num_micro_batches=num_micro_batches,
+            pipeline_schedule="inference",
+            layer_option="manual",
+            default_auto_sharding_option=alpa.AutoShardingOption(
+                enable_auto_sharding=False,
+            ),
+            stage_input_shardings=executable.stage_input_shard_specs)
+
+        # Compile other executables
+        for seq_len in encoder_chunk_sizes:
+            executable = alpa.parallelize(
+                inference_step_with_cache,
+                batch_argnums=(1,),
+                method=method_with_input_sharding).get_executable(
+                    params, {
+                        "input_ids":
+                            jax.core.ShapedArray(
+                                (batch_size, seq_len), jnp.int32),
+                        "position_ids":
+                            jax.core.ShapedArray(
+                                (batch_size, seq_len), jnp.int32),
+                        "cache":
+                            cache,
+                        "mask":
+                            mask,
+                    })
+            executable.dump_debug_info("tmp_executable_%d" % seq_len)
+            executables[seq_len] = executable
+        return executables, params
+    else:
+        assert len(encoder_chunk_sizes) == 1
+        seq_len = encoder_chunk_sizes[0]
+
+        @alpa.parallelize(batch_argnums=(1,), method=method)
+        def inference_step(params, batch):
+            output = model.apply(
+                params,
+                batch["input_ids"],
+                batch["position_ids"],
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states)
+            return output
+
+        assert batch_size % num_micro_batches == 0, "cannot divide batch_size by num_micro_batches"
+        micro_batch_size = batch_size // num_micro_batches
+
+        executable = inference_step.get_executable(
+            params, {
+                "input_ids":
+                    jax.core.ShapedArray(
+                        (batch_size, seq_len), jnp.int32),
+                "position_ids":
+                    jax.core.ShapedArray(
+                        (batch_size, seq_len), jnp.int32),
+            })
+
+        executable.dump_debug_info("tmp")
+    return {seq_len: executable}, params
+
+
+def load_opt_params_worker_func(self, path, prefix_to_idx, config, shapes,
+                                uuids, indices, mesh_ids):
+    """The worker function to load OPT parameters."""
+
+    def load_array(key):
+        return np.load(os.path.join(path, key))
+
+    def load_param(param_key, loaded_array, is_position_embedding=False):
+        i = prefix_to_idx[param_key]
+
+        for j in range(len(mesh_ids[i])):
+            if self.mesh_id != mesh_ids[i][j]:
+                continue
+
+            if not is_position_embedding:
+                assert shapes[i][j] == loaded_array.shape, (
+                    f"{shapes[i][j]} vs. {loaded_array.shape}")
+            else:
+                if shapes[i][j] != loaded_array.shape:
+                    assert shapes[i][j][1] == loaded_array.shape[1]
+                    loaded_array = loaded_array[:shapes[i][j][0], :]
+            uuid = uuids[i][j]
+            datas = []
+            for k in range(len(self.local_devices)):
+                idx = self.host_id * len(self.local_devices) + k
+                datas.append(loaded_array[indices[i][j][idx]])
+            self.put_buffers(uuid, datas)
+
+    load_param("params.transformers.embeddings.word_embeddings.embedding",
+               load_array("decoder.embed_tokens.weight"))
+    load_param("params.transformers.embeddings.position_embeddings.embedding",
+               load_array("decoder.embed_positions.weight"),
+               is_position_embedding=True)
+
+    if config.version > 2:
+        load_param("params.transformers.layer_norm.scale",
+                   load_array("decoder.layer_norm.weight"))
+        load_param("params.transformers.layer_norm.bias",
+                   load_array("decoder.layer_norm.bias"))
+
+    layers_per_stage = config.decoder_layers // config.num_pp_stages
+
+    for i in range(config.decoder_layers):
+        stage_id = i // layers_per_stage
+        if stage_id != self.mesh_id:
+            continue
+
+        param_prefix = f"params.transformers.encoder.{i}."
+        load_prefix = f"decoder.layers.{i}."
+        # Attention weights
+        wq = load_array(load_prefix + "self_attn.q_proj.weight")
+        wk = load_array(load_prefix + "self_attn.k_proj.weight")
+        wv = load_array(load_prefix + "self_attn.v_proj.weight")
+        dim = wq.shape[-1]
+        w_qkv = np.concatenate([wq, wk, wv], axis=0).reshape(
+            (3, -1, dim)).transpose([2, 1, 0]).reshape((dim, -1))
+        load_param(param_prefix + "attention.self.qkv_combined.kernel", w_qkv)
+        bq = load_array(load_prefix + "self_attn.q_proj.bias")
+        bk = load_array(load_prefix + "self_attn.k_proj.bias")
+        bv = load_array(load_prefix + "self_attn.v_proj.bias")
+        b_qkv = np.concatenate([bq, bk, bv], axis=0).reshape(
+            (3, dim)).transpose([1, 0]).reshape((-1,))
+        load_param(param_prefix + "attention.self.qkv_combined.bias", b_qkv)
+        load_param(
+            param_prefix + "attention.dense.kernel",
+            np.transpose(load_array(load_prefix + "self_attn.out_proj.weight")))
+        load_param(param_prefix + "attention.dense.bias",
+                   load_array(load_prefix + "self_attn.out_proj.bias"))
+        load_param(param_prefix + "attention.layer_norm.scale",
+                   load_array(load_prefix + "self_attn_layer_norm.weight"))
+        load_param(param_prefix + "attention.layer_norm.bias",
+                   load_array(load_prefix + "self_attn_layer_norm.bias"))
+        # FFN weights
+        load_param(param_prefix + "ffn.fc1.bias",
+                   load_array(load_prefix + "fc1.bias"))
+        load_param(param_prefix + "ffn.fc1.kernel",
+                   np.transpose(load_array(load_prefix + "fc1.weight")))
+        load_param(param_prefix + "ffn.fc2.bias",
+                   load_array(load_prefix + "fc2.bias"))
+        load_param(param_prefix + "ffn.fc2.kernel",
+                   np.transpose(load_array(load_prefix + "fc2.weight")))
+        load_param(param_prefix + "ffn.layer_norm.scale",
+                   load_array(load_prefix + "final_layer_norm.weight"))
+        load_param(param_prefix + "ffn.layer_norm.bias",
+                   load_array(load_prefix + "final_layer_norm.bias"))
+
+
+setattr(MeshHostWorker, "load_opt_params_worker_func",
+        load_opt_params_worker_func)
+
+
+def load_params_dis_array(path, executable, params_aval, config, dummy=False):
+    """Load parameters with distributed arrays."""
+    if dummy:
+        alpa.global_config.use_dummy_value_for_benchmarking = True
+        params_info, _ = executable.get_input_placement_specs()
+        flat_args, in_tree = tree_flatten(params_aval)
+        flat_info = tree_leaves(params_info)
+        if hasattr(executable, "mesh_group"):
+            ret = executable.mesh_group.shard_args_to_arrays(
+                flat_info, flat_args)
         else:
-            position_ids = jnp.broadcast_to(jnp.arange(seq_length, dtype="i4")[None, :], (batch_size, seq_length))
+            ret = executable.physical_mesh.shard_args_to_arrays_ps(
+                flat_info, flat_args)
+        alpa.global_config.use_dummy_value_for_benchmarking = False
+        return ret
 
-        return {
-            "past_key_values": past_key_values,
-            "attention_mask": extended_attention_mask,
-            "position_ids": position_ids,
-        }
+    params_info, _ = executable.get_input_placement_specs()
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        model_kwargs["past_key_values"] = model_outputs.past_key_values
-        model_kwargs["position_ids"] = model_kwargs["position_ids"][:, -1:] + 1
-        return model_kwargs
+    prefix_to_flat_idx = {}
+    ct = itertools.count()
+
+    def dfs(dict_tree, result_dict, cur_prefix):
+        if isinstance(dict_tree, (dict, flax.core.FrozenDict)):
+            for key in dict_tree.keys():
+                dfs(dict_tree[key], result_dict,
+                    cur_prefix + ("." if cur_prefix else "") + key)
+        else:
+            result_dict[cur_prefix] = next(ct)
+
+    dfs(params_aval, prefix_to_flat_idx, "")
+
+    flat_infos, in_tree = tree_flatten(params_info)
+
+    flat_shapes = []
+    flat_uuids = []
+    flat_indices = []
+    flat_mesh_ids = []
+    flat_arrays = []
+
+    mesh_group = executable.mesh_group
+
+    for info in flat_infos:
+        aval = info.aval
+        if len(info.mesh_ids) == 1:
+            mesh, spec = mesh_group[info.mesh_ids[0]], info.sharding_specs[0]
+            indices = pxla.spec_to_indices(aval.shape, spec)
+            ary_refs, ary_uuid = create_remote_array_refs(mesh)
+            flat_shapes.append([aval.shape])
+            flat_uuids.append([ary_uuid[0]])
+            flat_indices.append([indices])
+            flat_mesh_ids.append([mesh.mesh_id])
+            flat_arrays.append(
+                DistributedArray(mesh, aval, spec, ary_refs[0], indices))
+        else:
+            tmp_shapes = []
+            tmp_uuids = []
+            tmp_indices = []
+            tmp_mesh_ids = []
+            tmp_arrays = []
+            tmp_meshes = []
+            for mesh_id, spec in zip(info.mesh_ids, info.sharding_specs):
+                mesh = mesh_group[mesh_id]
+                indices = pxla.spec_to_indices(aval.shape, spec)
+                ary_refs, ary_uuid = create_remote_array_refs(mesh)
+                array = DistributedArray(mesh, aval, spec, ary_refs[0], indices)
+                tmp_shapes.append(aval.shape)
+                tmp_uuids.append(ary_uuid[0])
+                tmp_indices.append(indices)
+                tmp_mesh_ids.append(mesh.mesh_id)
+                tmp_meshes.append(mesh)
+                tmp_arrays.append(array)
+            flat_shapes.append(tuple(tmp_shapes))
+            flat_uuids.append(tuple(tmp_uuids))
+            flat_indices.append(tuple(tmp_indices))
+            flat_mesh_ids.append(tuple(tmp_mesh_ids))
+            flat_arrays.append(
+                ReplicatedDistributedArray(tmp_meshes, tmp_arrays))
+
+    for m in executable.mesh_group.meshes:
+        for w in m.workers:
+            w.load_opt_params_worker_func.remote(path, prefix_to_flat_idx,
+                                                 config, flat_shapes,
+                                                 flat_uuids, flat_indices,
+                                                 flat_mesh_ids)
+
+    return flat_arrays
 
 
-append_call_sample_docstring(
-    FlaxOPTForCausalLM,
-    _TOKENIZER_FOR_DOC,
-    _CHECKPOINT_FOR_DOC,
-    FlaxBaseModelOutput,
-    _CONFIG_FOR_DOC,
-)
+def init_cache_dis_array(executable, config, batch_size, dummy=False):
+    """Initialize cache with distributed arrays."""
+    cache = init_cache_np(config, batch_size)
+    alpa.global_config.use_dummy_value_for_benchmarking = dummy
+    _, batch_info = executable.get_input_placement_specs()
+    flat_args, in_tree = tree_flatten(cache)
+    flat_info = tree_leaves(batch_info["cache"])
+    if hasattr(executable, "mesh_group"):
+        ret = executable.mesh_group.shard_args_to_arrays(flat_info, flat_args)
+    else:
+        ret = executable.physical_mesh.shard_args_to_arrays_ps(
+            flat_info, flat_args)
+    alpa.global_config.use_dummy_value_for_benchmarking = False
+    return ret
+
+
+def load_multi_executable_params_dis_array(path,
+                                           executables,
+                                           params_aval,
+                                           config,
+                                           dummy=False):
+    """Load parameters to workers that will be used by all executables. Accordingly,
+    we need to make sure the parameter sharding specs are identical for all executables.
+    """
+    shared_input_shard_specs = None
+    for executable in executables.values():
+        stage_input_shard_specs = executable.stage_input_shard_specs
+        if shared_input_shard_specs is not None:
+            assert shared_input_shard_specs == stage_input_shard_specs, \
+                "All executables must have the same input sharding specs."
+        else:
+            shared_input_shard_specs = stage_input_shard_specs
+    return load_params_dis_array(path,
+                                 list(executables.values())[0], params_aval,
+                                 config, dummy)
+
+
+def init_multi_executable_cache_dis_array(executables,
+                                          config,
+                                          batch_size,
+                                          dummy=False):
+    """Initialize cache to workers that will be used by all executables. Accordingly,
+    we need to make sure all executables are using the same cache.
+    """
+    cache_info = None
+    for executable in executables.values():
+        _, batch_info = executable.get_input_placement_specs()
+        if cache_info is not None:
+            assert cache_info == batch_info["cache"], \
+                "All executables must share the same cache"
+        else:
+            cache_info = batch_info["cache"]
+    return init_cache_dis_array(
+        list(executables.values())[0], config, batch_size, dummy)
