@@ -254,6 +254,7 @@ class OPTSelfAttention(nn.Module):
         return query_layer, key_layer
 
 
+# TODO(chris): rename to CodeGenBlock
 class OPTAttention(nn.Module):
     config: OPTConfig
     dtype: jnp.dtype = jnp.float16
@@ -261,10 +262,7 @@ class OPTAttention(nn.Module):
     def setup(self):
         assert self.config.decoder_normalize_before
         self.self = OPTSelfAttention(self.config, dtype=self.dtype)
-        self.dense = nn.Dense(
-            self.config.decoder_embed_dim,
-            dtype=self.dtype,
-        )
+        self.mlp = OPTFFN(self.config)
         self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
                                        dtype=self.dtype)
 
@@ -281,8 +279,9 @@ class OPTAttention(nn.Module):
                                  attention_mask=attention_mask)
         attn_output = attn_outputs[0]
         attention_cache = attn_outputs[1]
-        hidden_states = self.dense(attn_output)
-        hidden_states = hidden_states + residual
+        
+        feed_forward_hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states + feed_forward_hidden_states + residual
         outputs = (hidden_states, attention_cache)
 
         if output_attentions:
