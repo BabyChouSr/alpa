@@ -116,7 +116,7 @@ class OPTEmbeddings(nn.Module):
         return hidden_states
 
 
-class OPTSelfAttention(nn.Module):
+class CodeGenAttention(nn.Module):
     config: OPTConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
@@ -255,14 +255,14 @@ class OPTSelfAttention(nn.Module):
 
 
 # TODO(chris): rename to CodeGenBlock
-class OPTAttention(nn.Module):
+class CodeGenBlock(nn.Module):
     config: OPTConfig
     dtype: jnp.dtype = jnp.float16
 
     def setup(self):
         assert self.config.decoder_normalize_before
-        self.self = OPTSelfAttention(self.config, dtype=self.dtype)
-        self.mlp = OPTFFN(self.config)
+        self.self = CodeGenAttention(self.config, dtype=self.dtype)
+        self.mlp = CodeGenMLP(self.config)
         self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
                                        dtype=self.dtype)
 
@@ -290,10 +290,11 @@ class OPTAttention(nn.Module):
         return outputs
 
 
-class OPTFFN(nn.Module):
+class CodeGenMLP(nn.Module):
     config: OPTConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
+    # TODO(chris): add intermediate_size = 4 * embed_dim ? 
     def setup(self):
         self.fc1 = nn.Dense(
             self.config.decoder_ffn_embed_dim,
@@ -326,8 +327,8 @@ class OPTTransformerLayer(nn.Module):
         assert not getattr(self.config, "scale_heads", False)
         assert not getattr(self.config, "scale_attn", False)
         assert not getattr(self.config, "scale_fc", False)
-        self.attention = OPTAttention(self.config, dtype=self.dtype)
-        self.ffn = OPTFFN(self.config, dtype=self.dtype)
+        self.attention = CodeGenBlock(self.config, dtype=self.dtype)
+        self.ffn = CodeGenMLP(self.config, dtype=self.dtype)
 
     def __call__(self,
                  hidden_states,
