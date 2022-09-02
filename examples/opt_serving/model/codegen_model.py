@@ -72,6 +72,7 @@ class CodeGenConfig:
     layer_norm_eps: float = 0.00001
     num_pp_stages: int = None,
     rotary_dim: int = 64
+    resid_pdrop: float = 0.0
     # parallelize
     mark_boundary: bool = True
 
@@ -254,7 +255,6 @@ class CodeGenAttention(nn.Module):
         return query_layer, key_layer
 
 
-# TODO(chris): rename to CodeGenBlock
 class CodeGenBlock(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16
@@ -294,10 +294,10 @@ class CodeGenMLP(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
-    # TODO(chris): add intermediate_size = 4 * embed_dim ? 
+    # TODO(chris): add intermediate_size = 4 * embed_dim ? - ffn embed dim  = 4 * embed dim
     def setup(self):
         self.fc_in = nn.Dense(
-            self.config.decoder_ffn_embed_dim * 4,
+            self.config.decoder_ffn_embed_dim,
             dtype=self.dtype,
         )
         self.act = ACT2FN[self.config.activation_fn]
@@ -534,7 +534,7 @@ class OPTForLMModule(nn.Module):
         )
 
 
-def get_opt_config(name, **kwargs):
+def get_codegen_config(name, **kwargs):
     if name == "125M":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=12, decoder_attention_heads=12,
