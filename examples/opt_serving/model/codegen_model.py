@@ -50,7 +50,7 @@ class OPTLMOutput(ModelOutput):
 
 
 @dataclass(frozen=True)
-class OPTConfig:
+class CodeGenConfig:
     # Inherited from OPT
     decoder_layers: int = 12
     max_target_positions: int = 2048
@@ -79,7 +79,7 @@ class OPTConfig:
 class OPTEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
 
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
@@ -117,7 +117,7 @@ class OPTEmbeddings(nn.Module):
 
 
 class CodeGenAttention(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
@@ -256,7 +256,7 @@ class CodeGenAttention(nn.Module):
 
 # TODO(chris): rename to CodeGenBlock
 class CodeGenBlock(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16
 
     def setup(self):
@@ -291,34 +291,34 @@ class CodeGenBlock(nn.Module):
 
 
 class CodeGenMLP(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     # TODO(chris): add intermediate_size = 4 * embed_dim ? 
     def setup(self):
-        self.fc1 = nn.Dense(
-            self.config.decoder_ffn_embed_dim,
+        self.fc_in = nn.Dense(
+            self.config.decoder_ffn_embed_dim * 4,
             dtype=self.dtype,
         )
-        self.activation = ACT2FN[self.config.activation_fn]
-        self.fc2 = nn.Dense(
+        self.act = ACT2FN[self.config.activation_fn]
+        self.fc_out = nn.Dense(
             self.config.decoder_embed_dim,
             dtype=self.dtype,
         )
-        self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
-                                       dtype=self.dtype)
+        self.dropout = nn.Dropout(self.config.resid_pdrop)
 
     def __call__(self, hidden_states):
         residual = hidden_states
-        hidden_states = self.layer_norm(hidden_states)
-        hidden_states = self.activation(self.fc1(hidden_states))
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = hidden_states + residual
+        # TODO(chris): we are changing order here to follow codegen, double check this is correct
+        hidden_states = self.fc_in(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.fc_out(hidden_states)
+        hidden_states = self.dropout(hidden_states)
         return hidden_states
 
 
 class OPTTransformerLayer(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
@@ -328,7 +328,7 @@ class OPTTransformerLayer(nn.Module):
         assert not getattr(self.config, "scale_attn", False)
         assert not getattr(self.config, "scale_fc", False)
         self.attention = CodeGenBlock(self.config, dtype=self.dtype)
-        self.ffn = CodeGenMLP(self.config, dtype=self.dtype)
+        self.mlp = CodeGenMLP(self.config, dtype=self.dtype)
 
     def __call__(self,
                  hidden_states,
@@ -343,7 +343,7 @@ class OPTTransformerLayer(nn.Module):
         attention_output = attention_outputs[0]
         attention_cache = attention_outputs[1]
 
-        hidden_states = self.ffn(attention_output)
+        hidden_states = self.mlp(attention_output)
 
         outputs = (hidden_states, attention_cache)
 
@@ -353,7 +353,7 @@ class OPTTransformerLayer(nn.Module):
 
 
 class OPTTransformerLayerCollection(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
@@ -416,7 +416,7 @@ class OPTTransformerLayerCollection(nn.Module):
 
 
 class OPTTransformerModule(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
@@ -464,7 +464,7 @@ class OPTTransformerModule(nn.Module):
 
 
 class OPTForLMModule(nn.Module):
-    config: OPTConfig
+    config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16
     bias_init: Callable[..., jnp.ndarray] = jax.nn.initializers.zeros
 
@@ -536,50 +536,50 @@ class OPTForLMModule(nn.Module):
 
 def get_opt_config(name, **kwargs):
     if name == "125M":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=12, decoder_attention_heads=12,
             decoder_embed_dim=768, decoder_input_dim=768, decoder_ffn_embed_dim=768 * 4,
             version=3,
         )
     elif name == "350M":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=24, decoder_attention_heads=16,
             decoder_embed_dim=1024, decoder_input_dim=1024, decoder_ffn_embed_dim=1024 * 4,
             version=2,
         )
         raise NotImplementedError()
     elif name == "1.3B":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=24, decoder_attention_heads=32,
             decoder_embed_dim=2048, decoder_input_dim=2048, decoder_ffn_embed_dim=2048 * 4,
             version=3,
         )
     elif name == "2.7B":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=32, decoder_attention_heads=32,
             decoder_embed_dim=2560, decoder_input_dim=2560, decoder_ffn_embed_dim=2560 * 4,
             version=3,
         )
     elif name == "6.7B":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=32, decoder_attention_heads=32,
             decoder_embed_dim=4096, decoder_input_dim=4096, decoder_ffn_embed_dim=4096 * 4,
             version=3,
         )
     elif name == "30B":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=48, decoder_attention_heads=56,
             decoder_embed_dim=7168, decoder_input_dim=7168, decoder_ffn_embed_dim=7168 * 4,
             version=3,
         )
     elif name == "66B":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=64, decoder_attention_heads=72,
             decoder_embed_dim=9216, decoder_input_dim=9216, decoder_ffn_embed_dim=9216 * 4,
             version=3,
         )
     elif name == "175B":
-        config = OPTConfig(
+        config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=96, decoder_attention_heads=96,
             decoder_embed_dim=12288, decoder_input_dim=12288, decoder_ffn_embed_dim=12288 * 4,
             version=3,
@@ -743,7 +743,7 @@ def load_params_np(params, path, config, dummy=False):
     return flax.core.freeze(params)
 
 
-def get_jax_executable(config: OPTConfig,
+def get_jax_executable(config: CodeGenConfig,
                        encoder_chunk_sizes: Sequence[int],
                        output_attentions: bool = False,
                        output_hidden_states:bool = False):
@@ -767,7 +767,7 @@ def get_jax_executable(config: OPTConfig,
     return executables, params
 
 
-def get_pipeshard_executable(config: OPTConfig,
+def get_pipeshard_executable(config: CodeGenConfig,
                              batch_size: int,
                              encoder_chunk_sizes: Sequence[int],
                              num_micro_batches: int = 1,
