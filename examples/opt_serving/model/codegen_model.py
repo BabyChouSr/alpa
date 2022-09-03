@@ -272,7 +272,6 @@ class CodeGenBlock(nn.Module):
     dtype: jnp.dtype = jnp.float16
 
     def setup(self):
-        assert self.config.decoder_normalize_before
         self.self = CodeGenAttention(self.config, dtype=self.dtype)
         self.mlp = CodeGenMLP(self.config)
         self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
@@ -334,7 +333,6 @@ class OPTTransformerLayer(nn.Module):
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
-        assert self.config.decoder_normalize_before
         assert not getattr(self.config, "cross_self_attention", False)
         assert not getattr(self.config, "scale_heads", False)
         assert not getattr(self.config, "scale_attn", False)
@@ -432,7 +430,6 @@ class OPTTransformerModule(nn.Module):
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
-        assert self.config.decoder_normalize_before
         self.embeddings = OPTEmbeddings(self.config, dtype=self.dtype)
         self.encoder = OPTTransformerLayerCollection(self.config,
                                                      dtype=self.dtype)
