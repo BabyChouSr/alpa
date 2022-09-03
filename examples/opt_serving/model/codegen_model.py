@@ -34,7 +34,7 @@ ACT2FN = {
 
 
 @flax.struct.dataclass
-class OPTModelOutput(ModelOutput):
+class CodeGenModelOutput(ModelOutput):
     last_hidden_state: jax_xla.DeviceArray
     hidden_states: Optional[Tuple[jax_xla.DeviceArray]] = None
     attentions: Optional[Tuple[jax_xla.DeviceArray]] = None
@@ -42,13 +42,14 @@ class OPTModelOutput(ModelOutput):
 
 
 @flax.struct.dataclass
-class OPTLMOutput(ModelOutput):
+class CodeGenLMOutput(ModelOutput):
     logits: jax_xla.DeviceArray
     hidden_states: Optional[Tuple[jax_xla.DeviceArray]] = None
     attentions: Optional[Tuple[jax_xla.DeviceArray]] = None
     attention_cache: Optional[Tuple[Tuple[jax_xla.DeviceArray]]] = None
 
 
+# TODO(chris): remove pad (need to check how embeddings for rotary position embeddings are done)
 @dataclass(frozen=True)
 class CodeGenConfig:
     # Inherited from CodeGen
@@ -64,7 +65,6 @@ class CodeGenConfig:
     # use_stable_embedding: bool = False
     # no_scale_embedding: bool = True
     # decoder_learned_pos: bool = True
-    # decoder_normalize_before: bool = True
     # share_decoder_input_output_embed: bool = True
     vocab_size: int = 50400
     max_target_positions: int = 2048
@@ -89,7 +89,7 @@ class CodeGenConfig:
     mark_boundary: bool = True
 
 
-class OPTEmbeddings(nn.Module):
+class CodeGenEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
 
     config: CodeGenConfig
@@ -328,7 +328,7 @@ class CodeGenMLP(nn.Module):
         return hidden_states
 
 
-class OPTTransformerLayer(nn.Module):
+class CodeGenTransformerLayer(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
@@ -362,13 +362,13 @@ class OPTTransformerLayer(nn.Module):
         return outputs
 
 
-class OPTTransformerLayerCollection(nn.Module):
+class CodeGenTransformerLayerCollection(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
         self.layers = [
-            OPTTransformerLayer(self.config, name=str(i), dtype=self.dtype)
+            CodeGenTransformerLayer(self.config, name=str(i), dtype=self.dtype)
             for i in range(self.config.decoder_layers)
         ]
 
@@ -419,22 +419,21 @@ class OPTTransformerLayerCollection(nn.Module):
         if not return_dict:
             return tuple(v for v in outputs if v is not None)
 
-        return OPTModelOutput(last_hidden_state=hidden_states,
+        return CodeGenModelOutput(last_hidden_state=hidden_states,
                               hidden_states=all_hidden_states,
                               attentions=all_attentions,
                               attention_cache=new_attention_cache)
 
 
-class OPTTransformerModule(nn.Module):
+class CodeGenTransformerModule(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
     def setup(self):
-        self.embeddings = OPTEmbeddings(self.config, dtype=self.dtype)
-        self.encoder = OPTTransformerLayerCollection(self.config,
+        self.embeddings = CodeGenEmbeddings(self.config, dtype=self.dtype)
+        self.encoder = CodeGenTransformerLayerCollection(self.config,
                                                      dtype=self.dtype)
-        if self.config.version > 2:
-            self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
+        self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
                                            dtype=self.dtype)
 
     def __call__(
@@ -457,14 +456,13 @@ class OPTTransformerModule(nn.Module):
             attention_mask=attention_mask
         )
         hidden_states = outputs[0]
-        if self.config.version > 2:
-            hidden_states = self.layer_norm(hidden_states)
+        hidden_states = self.layer_norm(hidden_states)
 
         if not return_dict:
             # if pooled is None, don't return it
             return (hidden_states,) + outputs[1:]
 
-        return OPTModelOutput(
+        return CodeGenModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -472,13 +470,13 @@ class OPTTransformerModule(nn.Module):
         )
 
 
-class OPTForLMModule(nn.Module):
+class CodeGenForLMModule(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16
     bias_init: Callable[..., jnp.ndarray] = jax.nn.initializers.zeros
 
     def setup(self):
-        self.transformers = OPTTransformerModule(config=self.config,
+        self.transformers = CodeGenTransformerModule(config=self.config,
                                                  dtype=self.dtype)
 
         self.project_out_dim = nn.Dense(
@@ -535,7 +533,7 @@ class OPTForLMModule(nn.Module):
         if not return_dict:
             return (logits,) + outputs[1:]
 
-        return OPTLMOutput(
+        return CodeGenLMOutput(
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
@@ -601,7 +599,7 @@ def get_codegen_config(name, **kwargs):
 
 def init_model_aval(config):
     """Initialize model with parameters with abstract values (shape-only arrays)."""
-    model = OPTForLMModule(config, dtype=config.dtype)
+    model = CodeGenForLMModule(config, dtype=config.dtype)
     rngkey = jax.core.ShapedArray((2,), jnp.uint32)
     input_ids = jax.core.ShapedArray((1, 128), jnp.int32)
     position_ids = jax.core.ShapedArray((1, 128), jnp.int32)
@@ -902,7 +900,7 @@ def get_pipeshard_executable(config: CodeGenConfig,
 
 def load_opt_params_worker_func(self, path, prefix_to_idx, config, shapes,
                                 uuids, indices, mesh_ids):
-    """The worker function to load OPT parameters."""
+    """The worker function to load CodeGen parameters."""
 
     def load_array(key):
         return np.load(os.path.join(path, key))
