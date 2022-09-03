@@ -84,11 +84,14 @@ class CodeGenConfig:
     bos_token_id: int = 50256
     eos_token_id: int = 50256
     # Added
+    decoder_input_dim: int = 4096
+    decoder_ffn_embed_dim: int = 16384
+    dtype: any = jnp.float16
     num_pp_stages: int = None,
     # parallelize
     mark_boundary: bool = True
 
-
+# TODO(chris) refactor: change embeddings to follow rotary position embeddings
 class CodeGenEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
 
