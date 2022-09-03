@@ -51,28 +51,40 @@ class OPTLMOutput(ModelOutput):
 
 @dataclass(frozen=True)
 class CodeGenConfig:
-    # Inherited from OPT
-    decoder_layers: int = 12
+    # Inherited from CodeGen
+    # decoder_layers: int = 20
+    # max_target_positions: int = 2048
+    # decoder_embed_dim: int = 768
+    # decoder_attention_heads: int = 12
+    # decoder_input_dim: int = 768
+    # decoder_ffn_embed_dim: int = 3072
+    # pad: int = 1
+    # activation_fn: str = 'relu'
+    # dtype: any = jnp.float16
+    # use_stable_embedding: bool = False
+    # no_scale_embedding: bool = True
+    # decoder_learned_pos: bool = True
+    # decoder_normalize_before: bool = True
+    # share_decoder_input_output_embed: bool = True
+    vocab_size: int = 50400
     max_target_positions: int = 2048
-    decoder_embed_dim: int = 768
-    decoder_attention_heads: int = 12
-    decoder_input_dim: int = 768
-    decoder_ffn_embed_dim: int = 3072
-    pad: int = 1
-    activation_fn: str = 'relu'
-    dtype: any = jnp.float16
-    use_stable_embedding: bool = False
-    no_scale_embedding: bool = True
-    decoder_learned_pos: bool = True
-    decoder_normalize_before: bool = True
-    share_decoder_input_output_embed: bool = True
-    # Added
-    version: int = 1
-    vocab_size: int = 50272
-    layer_norm_eps: float = 0.00001
-    num_pp_stages: int = None,
+    n_ctx: int = 2048
+    decoder_embed_dim: int = 4096
+    decoder_layers: int = 28
+    decoder_attention_heads: int = 16
     rotary_dim: int = 64
+    n_inner: int = None
+    activation_fn: str = 'gelu_new'
     resid_pdrop: float = 0.0
+    embd_pdrop: float = 0.0
+    attn_pdrop: float = 0.0
+    layer_norm_eps: float = 0.00001
+    initializer_range: float = 0.02
+    scale_attn_weights: bool = True
+    bos_token_id: int = 50256
+    eos_token_id: int = 50256
+    # Added
+    num_pp_stages: int = None,
     # parallelize
     mark_boundary: bool = True
 
@@ -533,7 +545,7 @@ class OPTForLMModule(nn.Module):
             attention_cache=outputs.attention_cache,
         )
 
-
+# TODO(chris) refactor: replace with hyperparameters from the paper
 def get_codegen_config(name, **kwargs):
     if name == "125M":
         config = CodeGenConfig(
