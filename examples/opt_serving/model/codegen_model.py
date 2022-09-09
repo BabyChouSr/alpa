@@ -91,6 +91,17 @@ class CodeGenConfig:
     # parallelize
     mark_boundary: bool = True
 
+
+# Copied from transformers.models.marian.modeling_flax_marian.create_sinusoidal_positions
+def create_sinusoidal_positions(n_pos, dim):
+    position_enc = np.array([[pos / np.power(10000, 2 * (j // 2) / dim) for j in range(dim)] for pos in range(n_pos)])
+    sentinel = dim // 2 + dim % 2
+    out = np.zeros_like(position_enc)
+    out[:, 0:sentinel] = np.sin(position_enc[:, 0::2])
+    out[:, sentinel:] = np.cos(position_enc[:, 1::2])
+
+    return jnp.array(out)
+
 # TODO(chris) refactor: change embeddings to follow rotary position embeddings
 class CodeGenEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings."""
@@ -148,7 +159,7 @@ class CodeGenAttention(nn.Module):
             dtype=self.dtype,
         )
         
-        self.rotary_value = self.config.rotary_value
+        self.rotary_dim = self.config.rotary_dim
 
     def __call__(self,
                  hidden_states,
@@ -177,15 +188,15 @@ class CodeGenAttention(nn.Module):
                                          head_dim))
         
 
-        # TODO(chris): fix this to check for the rotary_dim existence instead
-        if self.rotary_dim:
-            query_states, key_states, value_states = self.apply_rotary_position_embeddings(
-                sinusoidal_pos, query_states, key_states, value_states
-            )
-        else:
-            query_states, key_states = self.apply_rotary_position_embeddings(
-                sinusoidal_pos, query_states, key_states
-            )
+        if sinusoidal_pos is not None:
+            if self.rotary_dim:
+                query_states, key_states, value_states = self.apply_rotary_position_embeddings(
+                    sinusoidal_pos, query_states, key_states, value_states
+                )
+            else:
+                query_states, key_states = self.apply_rotary_position_embeddings(
+                    sinusoidal_pos, query_states, key_states
+                )
 
         batch_size = hidden_states.shape[0]
         if attention_cache is None:
@@ -282,12 +293,14 @@ class CodeGenBlock(nn.Module):
 
     def __call__(self,
                  hidden_states,
+                 sinusoidal_pos,
                  output_attentions: bool = False,
                  attention_cache=None,
                  attention_mask=None):
         residual = hidden_states
         hidden_states = self.layer_norm(hidden_states)
         attn_outputs = self.self(hidden_states,
+                                 sinusoidal_pos=sinusoidal_pos,
                                  output_attentions=output_attentions,
                                  attention_cache=attention_cache,
                                  attention_mask=attention_mask)
@@ -345,11 +358,13 @@ class CodeGenTransformerLayer(nn.Module):
 
     def __call__(self,
                  hidden_states,
+                 sinusoidal_pos,
                  output_attentions: bool = False,
                  attention_cache=None,
                  attention_mask=None):
 
         attention_outputs = self.attention(hidden_states,
+                                           sinusoidal_pos=sinusoidal_pos,
                                            output_attentions=output_attentions,
                                            attention_cache=attention_cache,
                                            attention_mask=attention_mask)
@@ -378,6 +393,7 @@ class CodeGenTransformerLayerCollection(nn.Module):
     def __call__(
         self,
         hidden_states,
+        sinusoidal_pos,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
@@ -405,6 +421,7 @@ class CodeGenTransformerLayerCollection(nn.Module):
             if attention_cache is not None:
                 layer_attention_cache = attention_cache[i]
             layer_outputs = layer(hidden_states,
+                                  sinusoidal_pos=sinusoidal_pos,
                                   output_attentions=output_attentions,
                                   attention_cache=layer_attention_cache,
                                   attention_mask=attention_mask)
@@ -434,6 +451,9 @@ class CodeGenTransformerModule(nn.Module):
 
     def setup(self):
         self.embeddings = CodeGenEmbeddings(self.config, dtype=self.dtype)
+        self.embed_positions = create_sinusoidal_positions(
+            self.config.max_target_positions, self.config.decoder_embed_dim // self.config.decoder_attention_heads
+        )
         self.encoder = CodeGenTransformerLayerCollection(self.config,
                                                      dtype=self.dtype)
         self.layer_norm = nn.LayerNorm(epsilon=self.config.layer_norm_eps,
@@ -450,10 +470,14 @@ class CodeGenTransformerModule(nn.Module):
         attention_mask=None
     ):
         hidden_states = self.embeddings(input_ids, position_ids)
+
+        sinusoidal_pos = self.embed_positions[: hidden_states.shape[1], :]
+
         outputs = self.encoder(
             hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            sinusoidal_pos=sinusoidal_pos,
             return_dict=return_dict,
             attention_cache=attention_cache,
             attention_mask=attention_mask
