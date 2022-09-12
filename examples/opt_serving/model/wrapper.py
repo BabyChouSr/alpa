@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 from transformers.generation_utils import GenerationMixin, ModelOutput, dataclass
-from transformers import OPTForCausalLM, GPT2LMHeadModel
+from transformers import OPTForCausalLM, GPT2LMHeadModel, CodeGenForCausalLM
 from tqdm import tqdm
 
 from opt_serving.model.opt_model import (get_opt_config,
@@ -220,6 +220,38 @@ def get_hf_opt_model(model_name, device, num_beams):
     return WrappedInferenceFunc(inference_func, inference_func_config,
                                 executable, transformer_config)
 
+def get_hf_codegen_model(model_name, device, num_beams):
+    disable_torch_init()
+    raw_model = CodeGenForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if "cuda" in device else torch.float32)
+    raw_model = raw_model.to(device)
+    restore_torch_init()
+
+    def inference_func(input_ids,
+                       past_key_values,
+                       attention_mask,
+                       output_attentions,
+                       output_hidden_states):
+        out = raw_model(input_ids=input_ids,
+                        past_key_values=past_key_values,
+                        attention_mask=attention_mask,
+                        output_attentions=output_attentions,
+                        output_hidden_states=output_hidden_states)
+        return InferenceFuncOutput(out.logits, out.past_key_values)
+
+    inference_func_config = InferenceFuncConfig(num_beams=num_beams)
+    for key in inference_func_config.__dataclass_fields__.keys():
+        setattr(inference_func_config, key, getattr(raw_model.config, key))
+    transformer_config = TransformerModelConfig(
+        H=raw_model.config.hidden_size,
+        L=raw_model.config.num_hidden_layers,
+        n_head=raw_model.config.num_attention_heads,
+        seq_len=raw_model.config.max_position_embeddings,
+        vocab_size=raw_model.config.vocab_size)
+    executable = None
+    return WrappedInferenceFunc(inference_func, inference_func_config,
+                                executable, transformer_config)
 
 def get_model(model_name: str,
               # Weights
@@ -268,6 +300,9 @@ def get_model(model_name: str,
     if autoregressive and num_micro_batches > 1:
         raise NotImplementedError(
             f"Cannot support num_micro_batches > 1 in autoregressive mode.")
+
+    if "Salesforce/codegen" in model_name:
+        return get_hf_codegen_model(model_name, torch_device, num_beams)
 
     if "facebook/opt" in model_name:
         return get_hf_opt_model(model_name, torch_device, num_beams)

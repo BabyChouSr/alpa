@@ -49,7 +49,7 @@ class CodeGenLMOutput(ModelOutput):
     attention_cache: Optional[Tuple[Tuple[jax_xla.DeviceArray]]] = None
 
 
-# TODO(chris): remove pad (need to check how embeddings for rotary position embeddings are done)
+# TODO(chris): figure out which config params need to be pruned
 @dataclass(frozen=True)
 class CodeGenConfig:
     # Inherited from CodeGen
@@ -321,7 +321,6 @@ class CodeGenMLP(nn.Module):
     config: CodeGenConfig
     dtype: jnp.dtype = jnp.float16  # the dtype of the computation
 
-    # TODO(chris): add intermediate_size = 4 * embed_dim ? - ffn embed dim  = 4 * embed dim
     def setup(self):
         self.fc_in = nn.Dense(
             self.config.decoder_ffn_embed_dim,
@@ -568,32 +567,27 @@ class CodeGenForLMModule(nn.Module):
         )
 
 # TODO(chris) refactor: replace with hyperparameters from the paper
-#  - dimensions per head?
 #  - weight decay
 def get_codegen_config(name, **kwargs):
     if name == "350M":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=20, decoder_attention_heads=16,
-            decoder_embed_dim=1024, decoder_input_dim=1024, decoder_ffn_embed_dim=1024 * 4,
-            version=2,
+            decoder_embed_dim=1024, decoder_input_dim=1024, decoder_ffn_embed_dim=1024 * 4
         )
     elif name == "2.7B":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=32, decoder_attention_heads=32,
-            decoder_embed_dim=2560, decoder_input_dim=2560, decoder_ffn_embed_dim=2560 * 4,
-            version=3,
+            decoder_embed_dim=2560, decoder_input_dim=2560, decoder_ffn_embed_dim=2560 * 4
         )
     elif name == "6.1B":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=33, decoder_attention_heads=16,
-            decoder_embed_dim=4096, decoder_input_dim=4096, decoder_ffn_embed_dim=4096 * 4,
-            version=3,
+            decoder_embed_dim=4096, decoder_input_dim=4096, decoder_ffn_embed_dim=4096 * 4
         )
     elif name == "16.1B":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=34, decoder_attention_heads=24,
-            decoder_embed_dim=7168, decoder_input_dim=7168, decoder_ffn_embed_dim=7168 * 4,
-            version=3,
+            decoder_embed_dim=7168, decoder_input_dim=7168, decoder_ffn_embed_dim=7168 * 4
         )
     else:
         raise ValueError(f"Invalid model name: {name}")
