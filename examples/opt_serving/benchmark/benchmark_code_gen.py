@@ -4,8 +4,8 @@ Usages:
 1. benchmark huggingface torch-based Codegen generation:
 python3 benchmark_code_gen.py --model Salesforce/codegen-350M-mono --debug
 
-2. benchmark jax.jit based OPT generation without alpa, on a single GPU:
-python3 benchmark_text_gen.py --model jax/opt-125m --debug
+2. benchmark jax.jit based Codegen generation without alpa, on a single GPU:
+python3 benchmark_code_gen.py --model jax/codegen-350m-mono --debug
 
 3. benchmark alpa parallelized OPT generation:
 python3 benchmark_text_gen.py --model alpa/opt-2.7b --debug
@@ -29,8 +29,9 @@ from opt_serving.model.opt_utils import compute_gpt_tflops_inference_with_paddin
 from opt_serving.model.wrapper import get_model
 
 test_prompts = [
-    "this function prints hello world",
-    "this function solves the two sum problem"
+    "This function prints hello world",
+    "Implement the two-sum problem on a given input pair.",
+    "Print the first five fibonacci numbers"
 ]
 
 if __name__ == "__main__":

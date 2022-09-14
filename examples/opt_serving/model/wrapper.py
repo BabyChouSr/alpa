@@ -25,6 +25,12 @@ from opt_serving.model.opt_model import (get_opt_config,
                                          init_multi_executable_cache_dis_array,
                                          load_params_np, init_cache_np,
                                          get_jax_executable)
+from opt_serving.model.codegen_model import (get_codegen_config,
+                                         get_pipeshard_executable,
+                                         load_multi_executable_params_dis_array,
+                                         init_multi_executable_cache_dis_array,
+                                         load_params_np, init_cache_np,
+                                         get_jax_executable)
 from opt_serving.model.opt_utils import (TransformerModelConfig,
                                          jax_index_select, is_power_of_two)
 
@@ -344,6 +350,28 @@ def get_model(model_name: str,
 
     if "jax/opt" in model_name:
         config = get_opt_config(name,
+                                num_pp_stages=None,
+                                mark_boundary=False,
+                                dtype=dtype,
+                                max_target_positions=max_target_positions)
+        transformer_config = TransformerModelConfig(
+            H=config.decoder_embed_dim,
+            L=config.decoder_layers,
+            n_head=config.decoder_attention_heads,
+            seq_len=config.max_target_positions,
+            vocab_size=config.vocab_size)
+
+        executables, params_aval = get_jax_executable(
+            config, encoder_chunk_sizes,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states)
+
+        # load params
+        params = load_params_np(params_aval, path, config, dummy)
+        init_cache = init_cache_np(config, batch_size=expand_size)
+        params, init_cache = jax.tree_map(jnp.array, (params, init_cache))
+    elif "jax/codegen" in model_name:
+        config = get_codegen_config(name,
                                 num_pp_stages=None,
                                 mark_boundary=False,
                                 dtype=dtype,
