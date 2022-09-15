@@ -5,7 +5,7 @@ Usages:
 python3 benchmark_code_gen.py --model Salesforce/codegen-350M-mono --debug
 
 2. benchmark jax.jit based Codegen generation without alpa, on a single GPU:
-python3 benchmark_code_gen.py --model jax/codegen-350m-mono --debug
+python3 benchmark_code_gen.py --model jax/codegen-350M-mono --debug
 
 3. benchmark alpa parallelized OPT generation:
 python3 benchmark_text_gen.py --model alpa/opt-2.7b --debug

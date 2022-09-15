@@ -313,7 +313,7 @@ def get_model(model_name: str,
     if "facebook/opt" in model_name:
         return get_hf_opt_model(model_name, torch_device, num_beams)
 
-    assert ("jax/opt" in model_name or "alpa/opt" in model_name)
+    assert ("jax/opt" in model_name or "alpa/opt" in model_name or "jax/codegen" in model_name)
     assert return_dict_in_generate
 
     if autoregressive and 1 not in encoder_chunk_sizes:
@@ -332,7 +332,10 @@ def get_model(model_name: str,
                                   "Please follow the instructions to download "
                                   "and convert weights manually. ")
             print(f"Cannot find cached weights under '{path}'.")
-            download_weights(model_name.split("/")[1], path)
+            if "codegen" in model_name:
+                download_codegen_weights(model_name.split("/")[1], path)
+            else:
+                download_weights(model_name.split("/")[1], path)
 
         assert os.path.exists(path), f"No such file or directory: '{path}'"
         embed_weight = os.path.join(path, "decoder.embed_tokens.weight")
@@ -617,6 +620,27 @@ def download_weights(model_name, path):
         with open(param_path, "wb") as f:
             np.save(f, param.cpu().detach().numpy())
 
+def download_codegen_weights(model_name, path):
+    """Download weights from huggingface."""
+    salesforce_model_name = "Salesforce/" + model_name
+    print(f"Load the pre-trained pytorch weights of {model_name} from huggingface. "
+          f"The downloading and cpu loading can take dozens of minutes. "
+          f"If it seems to get stuck, you can monitor the progress by "
+          f"checking the memory usage of this process.")
+
+    disable_torch_init()
+    model = CodeGenForCausalLM.from_pretrained(salesforce_model_name, torch_dtype=torch.float16,
+                                           _fast_init=True)
+    restore_torch_init()
+
+    os.makedirs(path, exist_ok=True)
+
+    # print(f"Convert the weights to alpa format under {path} ...")
+    # for name, param in tqdm(list(model.model.named_parameters())):
+    #     name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
+    #     param_path = os.path.join(path, name)
+    #     with open(param_path, "wb") as f:
+    #         np.save(f, param.cpu().detach().numpy())
 
 global torch_linear_init_backup
 global torch_layer_norm_init_backup
