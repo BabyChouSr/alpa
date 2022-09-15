@@ -635,12 +635,12 @@ def download_codegen_weights(model_name, path):
 
     os.makedirs(path, exist_ok=True)
 
-    # print(f"Convert the weights to alpa format under {path} ...")
-    # for name, param in tqdm(list(model.model.named_parameters())):
-    #     name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
-    #     param_path = os.path.join(path, name)
-    #     with open(param_path, "wb") as f:
-    #         np.save(f, param.cpu().detach().numpy())
+    print(f"Convert the weights to alpa format under {path} ...")
+    for name, param in tqdm(list(model.model.named_parameters())):
+        name = name.replace("decoder.final_layer_norm", "decoder.layer_norm")
+        param_path = os.path.join(path, name)
+        with open(param_path, "wb") as f:
+            np.save(f, param.cpu().detach().numpy())
 
 global torch_linear_init_backup
 global torch_layer_norm_init_backup
