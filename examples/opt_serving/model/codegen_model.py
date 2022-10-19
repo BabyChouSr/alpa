@@ -572,29 +572,33 @@ def get_codegen_config(name, **kwargs):
     if name == "350M":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=20, decoder_attention_heads=16,
-            decoder_embed_dim=1024, decoder_input_dim=1024, decoder_ffn_embed_dim=1024 * 4
+            decoder_embed_dim=1024, decoder_input_dim=1024, decoder_ffn_embed_dim=1024 * 4,
+            rotary_dim=32, bos_token_id=1
         )
     elif name == "2.7B":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=32, decoder_attention_heads=32,
-            decoder_embed_dim=2560, decoder_input_dim=2560, decoder_ffn_embed_dim=2560 * 4
+            decoder_embed_dim=2560, decoder_input_dim=2560, decoder_ffn_embed_dim=2560 * 4,
+            rotary_dim=64, bos_token_id=1
         )
     elif name == "6.1B":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=33, decoder_attention_heads=16,
-            decoder_embed_dim=4096, decoder_input_dim=4096, decoder_ffn_embed_dim=4096 * 4
+            decoder_embed_dim=4096, decoder_input_dim=4096, decoder_ffn_embed_dim=4096 * 4,
+            rotary_dim=64, bos_token_id=1
         )
     elif name == "16.1B":
         config = CodeGenConfig(
             max_target_positions=2048, decoder_layers=34, decoder_attention_heads=24,
-            decoder_embed_dim=7168, decoder_input_dim=7168, decoder_ffn_embed_dim=7168 * 4
+            decoder_embed_dim=6144, decoder_input_dim=6144, decoder_ffn_embed_dim=6144 * 4,
+            rotary_dim=64, bos_token_id=1
         )
     else:
         raise ValueError(f"Invalid model name: {name}")
 
     return dataclasses.replace(config, **kwargs)
 
-
+# TODO(chris): fix this to fit the same params as Codegen
 def init_model_aval(config):
     """Initialize model with parameters with abstract values (shape-only arrays)."""
     model = CodeGenForLMModule(config, dtype=config.dtype)
@@ -664,6 +668,7 @@ def inference_step_no_cache(params, batch, apply_func):
     return logits
 
 
+# TODO(chris): rename the loaded np arrays
 def load_params_np(params, path, config, dummy=False):
     """Load parameters with numpy arrays."""
     if dummy:
